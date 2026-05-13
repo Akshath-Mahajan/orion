@@ -2,7 +2,8 @@
 
 > Living plan for the IISWC 2026 characterization paper. Read this if you are
 > a fresh instance picking up the `feat/matmul-encoding` branch. Last updated:
-> 2026-05-12 (D6 BMM-III + MOAI Alg 4 + rowenc landed; D7/D8/D9 remain).
+> 2026-05-12 (BMM-III + MOAI Alg 4 + rowenc + lazy-relin everywhere + desilo
+> hoisting unblocked; D7/D8/D9 remain).
 
 ## 1. Context
 
@@ -88,10 +89,12 @@ Branch: `feat/matmul-encoding`, off `main`.
 | (gap) | **MOAI Algorithm 4** (`moai_cipher.py::moai_diag_col_bsgs_he`) — Diag×Col→Col, the second half of the Q·Kᵀ·V chain. Plus `moai_qkt_v_he` end-to-end runner that composes Alg 3 + Alg 4 without decrypt-and-repack. | **8/8 new cipher tests** (Alg 4 + chain × 2 backends). |
 | (gap) | **Row-encoding** (`rowenc_plain.py` + `rowenc_cipher.py`) — fourth/baseline encoding. Pack/extract/replicate/multiply per matmult/rowenc_*.go. Lazy-relin in source. | **8/8 cipher tests + 4 plaintext tests** (3 sizes × 2 backends + plaintext-oracle cross-check). |
 | (gap) | **conftest gc.collect fix** — collected-test count was tipping lattigo binding into a Go-runtime abort by test_moai's first item. Forces a Python GC + drop on module teardown. | Whole suite stays green at 86 items. |
+| (opt) | **Lazy-relin THOR + MOAI** (`thor_cipher.py`, `moai_cipher.py`) — port of Negar's `ThorCCMatMulHELazyRelin`; MOAI accumulates at deg-2 inside each (alpha, r) block and relinearizes once before the final-shift rotation. All 5 kernels now lazy in source. | 86/86 still green; bit-equivalent to eager path. |
+| (opt) | **Desilo hoisting unblocked** (`orion/backend/desilo/bindings.py`) — `RotateBatchNew` switched from the segfault-prone `(ct, key, deltas)` overload to the robust `(ct, list[FixedRotationKey])` overload, with a per-delta key cache. Suite drops 197s → 165s (~17%) without any kernel-side changes. | 86/86 green; rotate_batch now actually hoists. |
 
 **Aggregate oracle suite:** 46 tests under `tests/oracle/matmul_encodings/`,
 plus 40 plaintext tests under `benchmarks/matmul_encodings/plaintext/`.
-**86 total, all green on both backends, ~199s.**
+**86 total, all green on both backends, ~165s** (down from 199s pre-hoisting).
 
 **Non-regression check after binding additions:** LoLA on desilo runs clean —
 MAE 0.0000, Precision 22.8241 (reference 22.7654), Runtime 15.3s (reference
@@ -101,19 +104,34 @@ MAE 0.0000, Precision 22.8241 (reference 22.7654), Runtime 15.3s (reference
 
 These are non-obvious. Internalize before writing more kernels.
 
-1. **`engine.rotate_batch` segfault.** Negative deltas crash. Some non-consecutive
-   large positive deltas crash (`[8191, 8187, 8175]` reproducer in
-   `f3bd7bf` body). Workaround in `RotateBatchNew` is `all_safe = False` →
-   fall back to individual rotates. To repro and report upstream:
+1. **`engine.rotate_batch` overload selection.** desilofhe has two overloads
+   of `engine.rotate_batch`:
+   - `(ct, RotationKey, list[int])` — deltas-based; **unstable**, segfaults
+     on negative deltas, on large non-consecutive positives like
+     `[8191, 8187, 8175]`, and on most BSGS / BMM-I patterns (e.g.
+     `[5, 10, 15, 20, 25, 30]`).
+   - `(ct, list[FixedRotationKey])` — per-delta key list; **robust** across
+     every pattern we tested.
+
+   `RotateBatchNew` in the desilo binding now uses the FixedRotationKey
+   overload with a per-delta cache (built lazily, cleared on
+   `DeleteScheme`). This is the actual hoisting fix — the whole suite
+   gets ~17% faster with no kernel-side changes since every kernel was
+   already calling `ctx.rot_batch`. Reproducer for the bad overload (in
+   case it's worth filing upstream so they can fix it):
    ```python
    import desilofhe, numpy as np
    eng = desilofhe.Engine(max_level=4, mode='cpu')
    sk = eng.create_secret_key(); pk = eng.create_public_key(sk)
    rk = eng.create_rotation_key(sk)
    ct = eng.encrypt(eng.encode(np.zeros(eng.slot_count), level=4), pk)
-   eng.rotate_batch(ct, rk, [8191, 8187, 8175])   # segfaults
-   eng.rotate_batch(ct, rk, [-1, -5, -17])        # segfaults
-   eng.rotate_batch(ct, rk, [1, 2, 3])            # OK
+   eng.rotate_batch(ct, rk, [8191, 8187, 8175])         # segfaults
+   eng.rotate_batch(ct, rk, [-1, -5, -17])              # segfaults
+   eng.rotate_batch(ct, rk, [5, 10, 15, 20, 25, 30])    # segfaults
+   eng.rotate_batch(ct, rk, [1, 2, 3])                  # OK
+   # Robust path:
+   keys = [eng.create_fixed_rotation_key(sk, d) for d in [-1, -5, -17]]
+   eng.rotate_batch(ct, keys)                           # OK
    ```
 
 2. **`s = c·n·H` vs `s = ctx.slots` are NOT the same.** Conflating them was
@@ -135,7 +153,9 @@ These are non-obvious. Internalize before writing more kernels.
 5. **Lattigo binding lacks `MulNoRelinCiphertextNew`, `RelinearizeNew`,
    `RotateBatchNew`.** `Context` falls back gracefully: `mul_nr` → `mul_rl`,
    `relin` → no-op, `rot_batch` → list of individual `RotateNew`. Same
-   numerical result, just less efficient. Good — Lattigo is the oracle.
+   numerical result, just less efficient. Good — Lattigo is the oracle,
+   and D8 uses Negar's Go binary directly for the CPU baseline (which
+   does hoist via `eval.RotateHoistedNew`), so this gap is paper-irrelevant.
 
 6. **`backend.Encode` wants a Python `list`, not a `np.ndarray`.**
    Lattigo's ctypes wrapper auto-expands `list[float]` to `(ptr, len)`;
@@ -187,56 +207,35 @@ matplotlib bar chart, 2×N (CPU/GPU per encoding), annotated with
 rotation count, log-scale Y axis. Drop into the paper's figure
 section. Single Python script under `benchmarks/matmul_encodings/`.
 
-### Optimization pass (lazy-relin everywhere; ~0.5 day)
-Swap `ctx.mul_rl` for `ctx.mul_nr` in each kernel, then `ctx.relin` at
-the end. Re-run the oracle tests to confirm bit-equivalence. Re-run
-benchmarks to quantify the speedup (this is one of the paper's
-data points). Defer if time-constrained.
+### Optimization pass — DONE for both lazy-relin and hoisting
+Both halves of the optimization pass have landed.
 
-**Current lazy-relin status across the five kernels:**
+**Lazy-relin status** — all 5 kernels lazy in source:
 
 | Kernel  | Source uses              | Effective on desilo (GPU)  | Effective on lattigo (CPU oracle) |
 |---------|--------------------------|----------------------------|------------------------------------|
 | BMM-I   | `mul_nr` + final `relin` | **Lazy** (real)            | Eager (binding fallback)           |
 | BMM-III | `mul_nr` + finalize relin | **Lazy** (real)           | Eager (binding fallback)           |
 | RowEnc  | `mul_nr` + final `relin` | **Lazy** (real)            | Eager (binding fallback)           |
-| THOR    | `mul_rl` (eager)         | Eager                      | Eager                              |
-| MOAI    | `mul_rl` (eager)         | Eager                      | Eager                              |
+| THOR    | `mul_nr` + 2 relins/out  | **Lazy** (real)            | Eager (binding fallback)           |
+| MOAI    | `mul_nr` + per-block relin | **Lazy** (real)          | Eager (binding fallback)           |
 
-So lazy-relin is **partially implemented** (3/5):
-- BMM-I, BMM-III, RowEnc are genuinely lazy on desilo — the binding has
-  `MulNoRelinCiphertextNew` and `RelinearizeNew`, so products land as
-  deg-2 ciphertexts, accumulate at deg-2, and pay one relin per output
-  chunk instead of one per multiply.
-- THOR and MOAI still call `ctx.mul_rl` directly. This is the swap the
-  optimization pass is for. Negar's Go has lazy variants
-  (`ThorCCMatMulHELazyRelin`, MOAI's deferred-relin path) to crib from.
-- Lattigo always degrades to eager because the binding lacks both
-  verbs (`Context.mul_nr` → `MulRelinCiphertextNew`, `ctx.relin` → no-op).
-  Irrelevant if D8 uses Negar's Go binary for the CPU baseline; matters
-  only if we ever measure lattigo through our Python wrapper.
+Lattigo always degrades to eager because the binding lacks
+`MulNoRelinCiphertextNew` / `RelinearizeNew`. Irrelevant if D8 uses
+Negar's Go binary for the CPU baseline (which it does); matters only
+if we ever measure lattigo through our Python wrapper.
 
-### Open thread — figure out hoisting
-**Today, the entire suite runs without hoisted rotations on either
-backend.** Desilo's `engine.rotate_batch` segfaults on the access
-patterns BSGS / LongRot actually use (PLAN.md §5 reproducer), so
-`RotateBatchNew` is hard-gated to a Python loop of individual rotates
-(`all_safe = False`, [orion/backend/desilo/bindings.py:336]). The
-lattigo binding has no `RotateBatchNew` at all, so `Context.rot_batch`
-loops there too. All four kernels CALL `ctx.rot_batch` for their
-hoistable shifts — flipping these gates would re-enable hoisting
-suite-wide with zero kernel changes.
+**Hoisting status** — unblocked on desilo via the `FixedRotationKey`
+overload (gotcha #1). Every kernel was already calling `ctx.rot_batch`
+for its hoistable shifts, so flipping the binding to the safe overload
+re-enabled hoisting across all five kernels with zero kernel changes.
+Suite drops 197s → 165s (~17%). Lattigo binding still has no
+`RotateBatchNew` — listed under Open follow-ups below; paper-irrelevant
+since D8 uses Negar's Go.
 
-This matters for the paper's headline claim: "GPU ranking inverts vs
-CPU because rotations are bandwidth-bound on GPU" assumes hoisting is
-on at both ends. Without it, GPU is forced into N independent
-key-switches per logical batch, which inflates the GPU rotation cost
-artificially in our favour. Need to either (a) get hoisting working on
-desilo before May 21, or (b) explicitly note in the methodology that
-GPU numbers are pre-hoisting and argue the inversion still holds. Path
-(a) requires either a desilo upstream fix or a workaround in our
-binding; path (b) is a writing problem. Punt the choice until D8 has
-real numbers to look at, but don't forget.
+This makes the GPU vs CPU comparison fair on the rotation-amortization
+axis: both ends now hoist (Negar's Go via `eval.RotateHoistedNew`, our
+desilo via `engine.rotate_batch(ct, list[FixedRotationKey])`).
 
 ### Final regression check
 `/example-test-mm-encodings` on LoLA/MLP/ResNet against the
@@ -256,19 +255,24 @@ Order recommendation: **D7 (harness) first**. Reasons:
   truth for the sweep grid.
 - Roughly 1 day of mostly-mechanical wiring; no algorithmic risk.
 
-Once D7 emits CSVs for all four encodings (BMM-I, BMM-III, THOR, MOAI),
-D8 (CPU baseline) and D9 (headline figure) follow naturally and can
+Once D7 emits CSVs for all five encodings (BMM-I, BMM-III, THOR, MOAI,
+RowEnc), D8 (CPU baseline) and D9 (headline figure) follow naturally and can
 overlap.
 
-**Independent of D6:**
+**Open follow-ups (paper-irrelevant unless flagged):**
 1. Tighten `atol` in the oracle tests from `5e-1` down to `5e-2` —
    observed errors are ~1e-3, the loose bound was just being safe
    during development. Documents the actual noise floor.
 2. Add a `runners/_common.py` with timing helpers, then port one of
    Negar's runners as a sanity benchmark (BMM-I is simplest).
-3. File the `rotate_batch` segfault upstream (desilo issue tracker)
-   with the minimal repro from §5 — flips on hoisting amortization
-   "for free" if they fix it before the paper deadline.
+3. File the desilo `rotate_batch` overload-(1) segfault upstream with
+   the §5 reproducer. Not blocking: we already work around it via the
+   FixedRotationKey overload, but a fix would let us drop the per-delta
+   key cache and shrink the binding.
+4. Add `RotateBatchNew` + `MulNoRelinCiphertextNew` + `RelinearizeNew`
+   to the lattigo Go binding so `Context` doesn't degrade to eager / un-
+   hoisted on lattigo. Paper-irrelevant since D8 uses Negar's Go binary
+   directly; only matters if we ever benchmark lattigo through Python.
 
 ## 8. Quick reference
 
