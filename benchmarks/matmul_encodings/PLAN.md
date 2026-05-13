@@ -2,7 +2,7 @@
 
 > Living plan for the IISWC 2026 characterization paper. Read this if you are
 > a fresh instance picking up the `feat/matmul-encoding` branch. Last updated:
-> 2026-05-12 (D6 BMM-III landed; D7/D8/D9 remain).
+> 2026-05-12 (D6 BMM-III + MOAI Alg 4 + rowenc landed; D7/D8/D9 remain).
 
 ## 1. Context
 
@@ -85,10 +85,13 @@ Branch: `feat/matmul-encoding`, off `main`.
 | `f87b298` | **MOAI BSGS Col×Col kernel** (`moai_cipher.py`) — Algorithm 3. `test_moai.py`. | **6/6 passing** (3 shapes × 2 backends). |
 | `8f12317` | This PLAN.md + commit-author rewrite. | — |
 | (D6) | **BMM-III LongRot kernel** (`bmm3_cipher.py`) — cached-mode dispatcher with lazy-relin/lazy-rescale finalize. Plaintext oracle (`bmm3_plain.py` adds `long_rot_plain` + `bmm3_plain` + `bmm3_matmul_plain`). `test_bmm3.py` + 13 plaintext tests. | **8/8 cipher passing** (3 shapes × 2 backends + 2 oracle checks); **17/17 plaintext passing**. |
+| (gap) | **MOAI Algorithm 4** (`moai_cipher.py::moai_diag_col_bsgs_he`) — Diag×Col→Col, the second half of the Q·Kᵀ·V chain. Plus `moai_qkt_v_he` end-to-end runner that composes Alg 3 + Alg 4 without decrypt-and-repack. | **8/8 new cipher tests** (Alg 4 + chain × 2 backends). |
+| (gap) | **Row-encoding** (`rowenc_plain.py` + `rowenc_cipher.py`) — fourth/baseline encoding. Pack/extract/replicate/multiply per matmult/rowenc_*.go. Lazy-relin in source. | **8/8 cipher tests + 4 plaintext tests** (3 sizes × 2 backends + plaintext-oracle cross-check). |
+| (gap) | **conftest gc.collect fix** — collected-test count was tipping lattigo binding into a Go-runtime abort by test_moai's first item. Forces a Python GC + drop on module teardown. | Whole suite stays green at 86 items. |
 
-**Aggregate oracle suite:** 30 tests under `tests/oracle/matmul_encodings/`,
-plus 35 plaintext tests under `benchmarks/matmul_encodings/plaintext/`.
-**65 total, all green on both backends, ~144s.**
+**Aggregate oracle suite:** 46 tests under `tests/oracle/matmul_encodings/`,
+plus 40 plaintext tests under `benchmarks/matmul_encodings/plaintext/`.
+**86 total, all green on both backends, ~199s.**
 
 **Non-regression check after binding additions:** LoLA on desilo runs clean —
 MAE 0.0000, Precision 22.8241 (reference 22.7654), Runtime 15.3s (reference
@@ -190,17 +193,18 @@ the end. Re-run the oracle tests to confirm bit-equivalence. Re-run
 benchmarks to quantify the speedup (this is one of the paper's
 data points). Defer if time-constrained.
 
-**Current lazy-relin status across the four kernels:**
+**Current lazy-relin status across the five kernels:**
 
 | Kernel  | Source uses              | Effective on desilo (GPU)  | Effective on lattigo (CPU oracle) |
 |---------|--------------------------|----------------------------|------------------------------------|
 | BMM-I   | `mul_nr` + final `relin` | **Lazy** (real)            | Eager (binding fallback)           |
 | BMM-III | `mul_nr` + finalize relin | **Lazy** (real)           | Eager (binding fallback)           |
+| RowEnc  | `mul_nr` + final `relin` | **Lazy** (real)            | Eager (binding fallback)           |
 | THOR    | `mul_rl` (eager)         | Eager                      | Eager                              |
 | MOAI    | `mul_rl` (eager)         | Eager                      | Eager                              |
 
-So lazy-relin is **half-implemented**:
-- BMM-I and BMM-III are genuinely lazy on desilo — the binding has
+So lazy-relin is **partially implemented** (3/5):
+- BMM-I, BMM-III, RowEnc are genuinely lazy on desilo — the binding has
   `MulNoRelinCiphertextNew` and `RelinearizeNew`, so products land as
   deg-2 ciphertexts, accumulate at deg-2, and pay one relin per output
   chunk instead of one per multiply.
@@ -305,5 +309,8 @@ cd examples && python run_lola.py ../configs/lola_desilo.yml
 | `moai_cipher.go` | `benchmarks/matmul_encodings/kernels/moai_cipher.py` (Alg 3 only) |
 | `bmm3_plain.go` (helpers only) | `benchmarks/matmul_encodings/plaintext/bmm3_plain.py` |
 | `bmm3_cipher.go` (cached mode) | `benchmarks/matmul_encodings/kernels/bmm3_cipher.py` |
+| `moai_cipher.go::MoaiDiagColBSGSHE` (Alg 4) | `benchmarks/matmul_encodings/kernels/moai_cipher.py` |
+| `rowenc_plain.go` | `benchmarks/matmul_encodings/plaintext/rowenc_plain.py` |
+| `rowenc_cipher.go` | `benchmarks/matmul_encodings/kernels/rowenc_cipher.py` |
 | `init_lattigo.go` | `benchmarks/matmul_encodings/context.py` |
 | `util.go::OpCounts` | `benchmarks/matmul_encodings/plaintext/op_counts.py` |
