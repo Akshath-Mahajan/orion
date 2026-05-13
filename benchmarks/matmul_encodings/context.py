@@ -182,10 +182,28 @@ class Context:
         self.counts = OpCounts()
 
     def free(self, *ct_ids: int) -> None:
-        """Hint the backend that these ciphertexts are no longer needed.
+        """Drop ciphertext IDs the kernel no longer needs.
 
-        Currently a no-op on desilo since the binding holds them in a
-        Python dict that GC eventually reclaims; left as a hook for
-        when we add an explicit DeleteCiphertext path.
+        Desilo-only: the desilo binding holds ciphertexts in a Python
+        dict that pins GPU memory until DeleteScheme; THOR-scale kernels
+        OOM the GPU without explicit deletes. Lattigo's DeleteCiphertext
+        path is intentionally avoided in this codebase (see commented
+        __del__ in orion/backend/python/tensors.py) because calling it
+        during GC at program termination has historically caused
+        segfaults, so we no-op on lattigo and rely on DeleteScheme.
+
+        Silently skips None / already-freed IDs so kernels can free
+        conditionally without branching.
         """
-        return
+        if type(self.backend).__name__ != "DeSiLoLibrary":
+            return
+        delete = getattr(self.backend, "DeleteCiphertext", None)
+        if delete is None:
+            return
+        for cid in ct_ids:
+            if cid is None:
+                continue
+            try:
+                delete(cid)
+            except (KeyError, RuntimeError):
+                pass
