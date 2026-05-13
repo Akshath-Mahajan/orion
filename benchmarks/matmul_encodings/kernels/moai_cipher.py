@@ -2,12 +2,15 @@
 
 Ports of:
 - Algorithm 3 (Col x Col -> Diag, BSGS) from matmult/moai_cipher.go
-- Algorithm 4 (Diag x Col -> Col, BSGS) [TODO; this commit covers only Alg 3]
+- Algorithm 4 (Diag x Col -> Col, BSGS) from matmult/moai_cipher.go
 
 The Col x Col variant is the natural fit for Q . K^T in transformer
 self-attention. Q and K are both column-packed; the output is
 diag-packed and feeds Algorithm 4 (the next matmul, by V) without
-re-encoding.
+re-encoding -- which is the back-to-back-matmul property that motivates
+MOAI as an encoding choice in the first place. With both algorithms
+landed, a Q . K^T . V chain runs end-to-end on encrypted inputs without
+any intermediate decrypt-and-repack.
 
 BSGS structure (matmult/moai_plain.go moai_col_col_bsgs):
     b = ceil(sqrt(m)), g = ceil(m/b)
@@ -38,6 +41,8 @@ import numpy as np
 from ..context import Context
 from ..plaintext.moai_plain import (
     interleaved_column_pack,
+    interleaved_column_unpack,
+    interleaved_diag_pack,
     interleaved_diag_unpack,
 )
 
@@ -156,3 +161,143 @@ def moai_col_col_bsgs_end_to_end(
 
     decoded = np.stack([ctx.decrypt(ct)[:n_he] for ct in out_cts], axis=0)
     return interleaved_diag_unpack(decoded, m=m, n_batch=n_batch)
+
+
+# ---------------------------------------------------------------------------
+# Algorithm 4 -- Diag x Col -> Col (BSGS)
+#
+# Direct port of matmult/moai_cipher.go::MoaiDiagColBSGSHE. Mirrors the
+# plaintext oracle moai_plain.moai_diag_col_bsgs structure 1:1.
+# ---------------------------------------------------------------------------
+
+
+def encrypt_diag_packed(
+    ctx: Context,
+    Cs: np.ndarray,
+    n_he: int,
+) -> list[int]:
+    """Pack n_batch diag-packed (m x m) matrices into m ciphertexts."""
+    packed = interleaved_diag_pack(Cs, n_he=n_he)  # (m, n_he)
+    return [
+        ctx.encrypt(_tile_to_slots(packed[i], ctx.slots))
+        for i in range(packed.shape[0])
+    ]
+
+
+def moai_diag_col_bsgs_he(
+    ctx: Context,
+    C_cts: list[int],
+    V_cts: list[int],
+    m: int,
+    d_prime: int,
+    rot_stride: int,
+    n_he: int,
+) -> list[int]:
+    """BSGS Algorithm 4 on encrypted (diag-packed C, col-packed V).
+
+    Returns d' column-packed output ciphertexts. Outer loop is over j in
+    [0, d'); the inner BSGS decomposition is identical in structure to
+    Algorithm 3 but with the roles of "diag operand" and "col operand"
+    swapped: baby steps rotate V[j] by r*stride, giant step rotates the
+    sum (not the col operand) by alpha*b * stride at the end of each
+    block.
+    """
+    assert len(C_cts) == m
+    assert len(V_cts) == d_prime
+    b = _int_ceil_sqrt(m)
+    g = (m + b - 1) // b
+
+    out_cts: list[int | None] = [None] * d_prime
+
+    for j in range(d_prime):
+        # Baby steps on V[j]: hoisted batch rotate by r*stride for r in [1, b).
+        baby_shifts = [r * rot_stride for r in range(1, b)]
+        beta: list[int] = [V_cts[j]]  # r=0 identity
+        if baby_shifts:
+            rotated = ctx.rot_batch(V_cts[j], baby_shifts)
+            beta.extend(rotated)
+
+        for alpha in range(g):
+            shift = (alpha * b) % m
+            c_rot_shift = ((m - shift) * rot_stride) % n_he
+
+            # Inner accumulator: inner = sum_r Rot(C[idx], c_rot_shift) * beta[r]
+            inner: int | None = None
+            for r in range(b):
+                idx = alpha * b + r
+                if idx >= m:
+                    break
+
+                if c_rot_shift == 0:
+                    rot_c = C_cts[idx]
+                else:
+                    rot_c = ctx.rot(C_cts[idx], c_rot_shift)
+
+                prod = ctx.mul_rl(rot_c, beta[r])
+                prod = ctx.rescale(prod)
+                inner = prod if inner is None else ctx.add(inner, prod)
+
+            assert inner is not None  # at least r=0 ran
+
+            final_shift = (shift * rot_stride) % n_he
+            if final_shift != 0:
+                inner = ctx.rot(inner, final_shift)
+
+            if out_cts[j] is None:
+                out_cts[j] = inner
+            else:
+                out_cts[j] = ctx.add(out_cts[j], inner)
+
+    return out_cts  # type: ignore[return-value]
+
+
+def moai_diag_col_bsgs_end_to_end(
+    ctx: Context,
+    Cs: np.ndarray,
+    Vs: np.ndarray,
+) -> np.ndarray:
+    """Encrypt n_batch (m x m) diag-packed C and (m x d') col-packed V,
+    run Alg 4, decrypt + col-unpack.
+
+    Returns shape (n_batch, m, d') with result[s] = Cs[s] @ Vs[s].
+    """
+    n_batch, m, m2 = Cs.shape
+    assert m == m2, f"C must be square per batch, got {Cs.shape}"
+    n_batch2, m3, d_prime = Vs.shape
+    assert (n_batch, m) == (n_batch2, m3), (
+        f"batch / m mismatch: C is {Cs.shape}, V is {Vs.shape}"
+    )
+    n_he = n_batch * m
+    rot_stride = n_batch
+
+    C_cts = encrypt_diag_packed(ctx, Cs, n_he=n_he)
+    V_cts = encrypt_col_packed(ctx, Vs, n_he=n_he)
+    out_cts = moai_diag_col_bsgs_he(
+        ctx, C_cts, V_cts, m=m, d_prime=d_prime, rot_stride=rot_stride, n_he=n_he,
+    )
+
+    decoded = np.stack([ctx.decrypt(ct)[:n_he] for ct in out_cts], axis=0)
+    return interleaved_column_unpack(decoded, m=m, n_batch=n_batch)
+
+
+# ---------------------------------------------------------------------------
+# Convenience: end-to-end Q . K^T . V chain (back-to-back matmul)
+# ---------------------------------------------------------------------------
+
+
+def moai_qkt_v_he(
+    ctx: Context,
+    Qs: np.ndarray,
+    Ks: np.ndarray,
+    Vs: np.ndarray,
+) -> np.ndarray:
+    """Run Q . K^T (Alg 3) then (Q . K^T) . V (Alg 4) end-to-end on encrypted
+    inputs. Demonstrates that MOAI's encoding-output of Alg 3 (diag-pack)
+    feeds directly into Alg 4 with no decrypt-and-repack -- the property
+    that motivates MOAI as an encoding choice.
+
+    Returns shape (n_batch, m, d_v) with result[s] = Qs[s] @ Ks[s].T @ Vs[s].
+    """
+    n_batch, m, d_prime = Qs.shape
+    qkt = moai_col_col_bsgs_end_to_end(ctx, Qs, Ks)  # (n_batch, m, m), diag
+    return moai_diag_col_bsgs_end_to_end(ctx, qkt, Vs)
