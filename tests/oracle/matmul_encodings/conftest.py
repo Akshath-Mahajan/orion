@@ -9,6 +9,7 @@ the kernel itself is correct.
 from __future__ import annotations
 
 import gc
+import os
 
 import pytest
 
@@ -22,6 +23,15 @@ def _make_config(backend: str) -> dict:
     matches Negar's Lattigo runner default and gives 4 usable mult
     levels -- enough for a single CMult + Rescale per kernel call.
     """
+    orion_cfg = {
+        "backend": backend,
+        "io_mode": "none",
+        "debug": False,
+    }
+    # GPU opt-in for the desilo backend. Lattigo has no GPU path in
+    # this wheel, so we only thread device through for desilo.
+    if backend == "desilo":
+        orion_cfg["device"] = os.environ.get("ORION_DESILO_DEVICE", "cpu")
     return {
         "ckks_params": {
             "LogN": 13,
@@ -31,11 +41,7 @@ def _make_config(backend: str) -> dict:
             "H": 8192,
             "RingType": "ConjugateInvariant",
         },
-        "orion": {
-            "backend": backend,
-            "io_mode": "none",
-            "debug": False,
-        },
+        "orion": orion_cfg,
     }
 
 
