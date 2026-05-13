@@ -1,0 +1,101 @@
+diff --git a/matmult/bmm1_runner.go b/matmult/bmm1_runner.go
+index fa408b1..eef71a0 100644
+--- a/matmult/bmm1_runner.go
++++ b/matmult/bmm1_runner.go
+@@ -240,4 +240,12 @@ func RunBmm1HE(
+ 	}
+ 	fmt.Printf("\n  |  th_rot=%6d  th_mul=%6d  th_add=%6d  th_ks=%6d\n",
+ 		thRot, thMult, thAdd, thKs)
++
++	errVal := -1.0
++	if verify {
++		errVal = maxErr
++	}
++	csvEmit("bmm1",
++		fmt.Sprintf("(%d,%d,%d)/blk(%d,%d,%d)", N, M, P, sN, sM, sP),
++		nHE, len(elapseds), mean, stdev, thRot, thMult, 0, errVal)
+ }
+diff --git a/matmult/bmm3_runner.go b/matmult/bmm3_runner.go
+index b9c88cf..65604e5 100644
+--- a/matmult/bmm3_runner.go
++++ b/matmult/bmm3_runner.go
+@@ -139,6 +139,17 @@ func RunBmm3HE(
+ 		fmt.Printf("  |  max_err=%.2e", maxErr)
+ 	}
+ 	fmt.Println()
++
++	errVal := -1.0
++	if verify {
++		errVal = maxErr
++	}
++	// BMM-III ops: ~m * stop ct*ct, ~m mask sites per LongRot pair.
++	// Plain shape spec is (n,m,p); the cipher kernel doesn't expose
++	// counted op tallies so we leave rotations / ct_pt as 0 in the
++	// CSV and surface the bookkeeping via the existing stdout report.
++	csvEmit("bmm3", fmt.Sprintf("(%d,%d,%d)", n, m, p),
++		nHE, len(elapseds), mean, stdev, 0, 0, 0, errVal)
+ }
+ 
+ // encryptChunks encodes + encrypts every chunk at `inputLevel`, default
+diff --git a/matmult/moai_runner.go b/matmult/moai_runner.go
+index ac10508..aee72fa 100644
+--- a/matmult/moai_runner.go
++++ b/matmult/moai_runner.go
+@@ -314,6 +314,22 @@ func RunMoaiHE(
+ 	}
+ 	fmt.Printf("\n  |  th_rot_n=%8d  th_mul_n=%8d  th_ks_n=%8d\n", thRotN, thMulN, thKsN)
+ 	fmt.Printf("  |  th_rot_b=%8d  th_mul_b=%8d  th_ks_b=%8d\n", thRotB, thMulB, thKsB)
++
++	errVal := -1.0
++	if verify {
++		errVal = maxErr
++	}
++	kernelName := "moai_alg3"  // colCol == true
++	if !colCol {
++		kernelName = "moai_alg4"
++	}
++	thRot, thMul := thRotN, thMulN
++	if bsgs {
++		thRot, thMul = thRotB, thMulB
++	}
++	csvEmit(kernelName,
++		fmt.Sprintf("batch=%d,m=%d,d'=%d,bsgs=%v", nBatch, m, dPrime, bsgs),
++		ctx.NHE, len(elapseds), mean, stdev, thRot, thMul, 0, errVal)
+ }
+ 
+ // encryptVecsAtScale encodes each slot vector at the given level and scale,
+diff --git a/matmult/rowenc_runner.go b/matmult/rowenc_runner.go
+index c542b1a..ef845c4 100644
+--- a/matmult/rowenc_runner.go
++++ b/matmult/rowenc_runner.go
+@@ -181,4 +181,11 @@ func RunRowHE(
+ 	}
+ 	fmt.Printf("\n  |  th_rot=%6d  th_pmult=%6d  th_mult=%6d  th_add=%6d  th_ks=%6d\n",
+ 		thRot, thPMult, thMult, thAdd, thKs)
++
++	errVal := -1.0
++	if verify {
++		errVal = maxErr
++	}
++	csvEmit("rowenc", fmt.Sprintf("n=%d", n), int(ctx.NHE), len(elapseds),
++		mean, stdev, thRot, thMult, thPMult, errVal)
+ }
+diff --git a/matmult/thor_runner.go b/matmult/thor_runner.go
+index a381a59..142fcf3 100644
+--- a/matmult/thor_runner.go
++++ b/matmult/thor_runner.go
+@@ -394,6 +394,14 @@ func RunThorHE(
+ 		fmt.Printf("  |  max_err=%.2e", maxErr)
+ 	}
+ 	fmt.Println()
++
++	errVal := -1.0
++	if verify {
++		errVal = maxErr
++	}
++	csvEmit("thor",
++		fmt.Sprintf("d=%d,n=%d,H=%d,s=%d,c=%d", d, n, H, s, c),
++		s, len(elapseds), mean, stdev, 0, 0, 0, errVal)
+ }
+ 
+ func meanStdev(ds []time.Duration) (mean, stdev time.Duration) {

@@ -2,8 +2,8 @@
 
 > Living plan for the IISWC 2026 characterization paper. Read this if you are
 > a fresh instance picking up the `feat/matmul-encoding` branch. Last updated:
-> 2026-05-12 (BMM-III + MOAI Alg 4 + rowenc + lazy-relin everywhere + desilo
-> hoisting unblocked + D7 harness; D8/D9 remain).
+> 2026-05-13 (BMM-III + MOAI Alg 4 + rowenc + lazy-relin everywhere + desilo
+> hoisting unblocked + D7 harness + D8 CPU baseline tooling; D9 remains).
 
 ## 1. Context
 
@@ -240,11 +240,44 @@ The output dir `benchmarks/matmul_encodings/results/` is gitignored
    per-rotation cost difference (~2x more slots ≈ ~2x rotation cost) as
    a documented caveat in the methodology section.
 
-### D8 — CPU baseline rerun (~0.5 day)
-Build and run `matmul-encoding-material/MatMult/matmult/` on this
-machine to produce a fair CPU baseline at the exact same shapes the
-GPU runs at. Requires Go installed; should already be — try
-`go version`. If not, install via conda.
+### D8 — CPU baseline rerun (DONE)
+Tooling lives under `benchmarks/matmul_encodings/cpu_baseline/`:
+
+  * `csv_emit.go` + `memsnap.go` — package-local shims for the
+    `matmul-encoding-material/MatMult/matmult/` Go source. The first
+    adds a CSV writer hung off `BENCH_CSV_OUT`; the second supplies the
+    `TakeMemSnap` / `PrintMemDelta` functions that her runners reference
+    but never define (without these `go build` fails out of the box).
+  * `matmult_csv_emit.patch` — diff against each `*_runner.go`
+    that adds one `csvEmit(...)` call at the end of every per-shape
+    report block, mirroring the pretty-print but in our harness CSV
+    schema (`backend, device, kernel, shape, n_he, n_trials,
+    mean_seconds, std_seconds, rotations, ct_ct_muls, ct_pt_muls,
+    peak_hbm_mb, max_abs_err`).
+  * `run.sh` — driver that copies the shims into the gitignored matmult
+    clone, applies the patch if not already applied, builds the binary,
+    drives the menu via stdin to run all five HE suites in order, and
+    writes the combined CSV.
+  * `README.md` — the why and how.
+
+Why patches and not a fork: `matmul-encoding-material/` is a sibling
+clone gitignored from orion, so direct edits there can't be tracked.
+Patches living in our repo are the only way to keep D8 reproducible.
+
+Run examples:
+```bash
+ORION_ROOT=$HOME/orion ./benchmarks/matmul_encodings/cpu_baseline/run.sh
+MATMULT_TRIALS=3 ./benchmarks/matmul_encodings/cpu_baseline/run.sh   # tighter stdev
+```
+
+Output: `benchmarks/matmul_encodings/results/cpu_baseline_paper.csv`.
+Schema matches our Python harness exactly so D9 can `pd.read_csv` both
+the CPU and GPU sweeps and concatenate.
+
+Wall-clock budget: the default paper preset includes 2048-class shapes
+for THOR + MOAI and (1024, 1027, 1025) for BMM-III; one sweep at
+`-trials 1` takes on the order of an hour. Edit each `*_runner.go`'s
+shape table for smaller smoke runs.
 
 ### D9 — Headline figure (~0.5 day)
 matplotlib bar chart, 2×N (CPU/GPU per encoding), annotated with
