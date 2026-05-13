@@ -2,7 +2,7 @@
 
 > Living plan for the IISWC 2026 characterization paper. Read this if you are
 > a fresh instance picking up the `feat/matmul-encoding` branch. Last updated:
-> 2026-05-12.
+> 2026-05-12 (D6 BMM-III landed; D7/D8/D9 remain).
 
 ## 1. Context
 
@@ -83,9 +83,12 @@ Branch: `feat/matmul-encoding`, off `main`.
 | `ffaf48e` | **BMM-I kernel** (`bmm1_cipher.py`) — hoisted bicycle. Plus `tests/oracle/matmul_encodings/conftest.py` (backend-parameterized) and `test_bmm1.py`. | **10/10 passing** (5 lattigo + 5 desilo). |
 | `2501d25` | **THOR kernel** (`thor_cipher.py`) — Algorithm 2 with mu3 explicit + ones-mask for level alignment (avoids DropLevel which neither binding exposes). `test_thor.py`. | **6/6 passing** (3 shapes × 2 backends). |
 | `f87b298` | **MOAI BSGS Col×Col kernel** (`moai_cipher.py`) — Algorithm 3. `test_moai.py`. | **6/6 passing** (3 shapes × 2 backends). |
-| (next) | This PLAN.md + commit-author rewrite. | — |
+| `8f12317` | This PLAN.md + commit-author rewrite. | — |
+| (D6) | **BMM-III LongRot kernel** (`bmm3_cipher.py`) — cached-mode dispatcher with lazy-relin/lazy-rescale finalize. Plaintext oracle (`bmm3_plain.py` adds `long_rot_plain` + `bmm3_plain` + `bmm3_matmul_plain`). `test_bmm3.py` + 13 plaintext tests. | **8/8 cipher passing** (3 shapes × 2 backends + 2 oracle checks); **17/17 plaintext passing**. |
 
-**Aggregate oracle suite:** 22 tests, all green on both backends.
+**Aggregate oracle suite:** 30 tests under `tests/oracle/matmul_encodings/`,
+plus 35 plaintext tests under `benchmarks/matmul_encodings/plaintext/`.
+**65 total, all green on both backends, ~144s.**
 
 **Non-regression check after binding additions:** LoLA on desilo runs clean —
 MAE 0.0000, Precision 22.8241 (reference 22.7654), Runtime 15.3s (reference
@@ -140,23 +143,28 @@ These are non-obvious. Internalize before writing more kernels.
 
 Ordered, with rough estimates. Deadlines: abstract 2026-05-14, paper 2026-05-21.
 
-### D6 — BMM-III LongRot kernel + tests (next big chunk; estimated 4-6 hours)
-The hardest port. The plaintext oracle does NOT exist (neither in Negar's
-Go nor in our Python — `bmm3_plain.go` is explicitly "HE-only" with
-helpers only). Need to either:
+### D6 — BMM-III LongRot kernel + tests (DONE)
+Picked Option A — ported the plaintext oracle (`long_rot_plain` +
+`bmm3_plain` + `bmm3_matmul_plain` in `plaintext/bmm3_plain.py`) before
+the cipher kernel, validated chunk stitching against
+`concat(chunks)[:enc_len] -> rotate -> chunk` reference at 12 LongRot
+configs, then ran the cipher kernel against both numpy.matmul and the
+plaintext oracle on both backends.
 
-- **Option A**: port a plaintext LongRot simulator first
-  (`benchmarks/matmul_encodings/plaintext/bmm3_plain.py` adds a
-  `bmm3_long_rot` and `bmm3_plain` kernel), then build the cipher kernel
-  against it. ~3h plaintext + ~2h cipher.
-- **Option B**: port the cipher kernel and validate against numpy.matmul
-  directly (skipping the plaintext oracle layer). ~3-4h. Faster but loses
-  one of the three correctness layers.
+**Implementation note on cached vs naive mode.** The first port used
+"naive" (re-encode masks every call) which crashed Lattigo with a Go
+panic on shape (8, 9, 11) at n_he=32 — the binding's plaintext table
+balloons under m × stop × ~7 mask sites per LongRot. Switched to "cached"
+mode (matmult/bmm3_cipher.go::Bmm3ModeCached): one encode per (start,
+end) per BMM-III call, reused across iterations and both A/B sides.
+Suite stable in ~144s.
 
-The LongRot primitive itself: 3 steps — (1) intra-chunk rotation,
-(2) stitch + mask across chunk boundary, (3) finalize partial chunk.
-See `matmult/bmm3_cipher.go:204-366` (lines change but that's the
-neighbourhood as of the cloned commit).
+**Hoisted mode** (matmult/bmm3_cipher.go::Bmm3ModeHoisted, block-hoisted
+rotations on top of the cache) is not ported. Would slot in after D7 if
+benchmark numbers show LongRot Step-1 dominates wall-clock — but the
+rotate_batch segfault (Decision #6) currently gates hoisting off
+anyway, so the cached vs hoisted comparison can't go in the paper until
+upstream desilo fixes that.
 
 ### D7 — Benchmark harness (~1 day)
 Mirror `matmult/main.go`'s runner pattern: per-encoding shape sweep,
@@ -189,20 +197,20 @@ LoLA; rerun after all kernel work to confirm no slow regressions.
 
 ## 7. Suggested next move for the new instance
 
-**My recommendation**: tackle **D6 (BMM-III)** next.
+**With D6 landed**, the path to the May-21 paper is D7 → D8 → D9.
 
-Reasoning:
-- It's the only kernel left for the paper's coverage claim.
-- Abstract doesn't need it (per Decision #3 above), so deadline pressure
-  for the abstract is already off.
-- D7/D8/D9 are mostly mechanical once D6 lands; they can pack into the
-  back half of the week.
-- The longer BMM-III blocks, the riskier the May 21 paper deadline.
+Order recommendation: **D7 (harness) first**. Reasons:
+- Harness output is the data feed for both the CPU-baseline rerun (D8)
+  and the headline figure (D9). Building it first lets D8/D9 just
+  consume CSVs.
+- Mirrors `matmult/main.go`'s shape sweep so GPU vs CPU lines up
+  shape-for-shape. Negar's tables in `*_runner.go` are the source of
+  truth for the sweep grid.
+- Roughly 1 day of mostly-mechanical wiring; no algorithmic risk.
 
-**Alternative** if BMM-III blocks: skip to D7 (harness) and ship the
-paper with three encodings (THOR / MOAI / BMM-I), framing the
-"large-shape bicycle" story qualitatively rather than empirically.
-Acceptable as a fallback.
+Once D7 emits CSVs for all four encodings (BMM-I, BMM-III, THOR, MOAI),
+D8 (CPU baseline) and D9 (headline figure) follow naturally and can
+overlap.
 
 **Independent of D6:**
 1. Tighten `atol` in the oracle tests from `5e-1` down to `5e-2` —
@@ -252,6 +260,6 @@ cd examples && python run_lola.py ../configs/lola_desilo.yml
 | `moai_plain.go` | `benchmarks/matmul_encodings/plaintext/moai_plain.py` |
 | `moai_cipher.go` | `benchmarks/matmul_encodings/kernels/moai_cipher.py` (Alg 3 only) |
 | `bmm3_plain.go` (helpers only) | `benchmarks/matmul_encodings/plaintext/bmm3_plain.py` |
-| `bmm3_cipher.go` | TODO (D6) |
+| `bmm3_cipher.go` (cached mode) | `benchmarks/matmul_encodings/kernels/bmm3_cipher.py` |
 | `init_lattigo.go` | `benchmarks/matmul_encodings/context.py` |
 | `util.go::OpCounts` | `benchmarks/matmul_encodings/plaintext/op_counts.py` |
