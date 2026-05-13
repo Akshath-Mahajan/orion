@@ -3,7 +3,7 @@
 > Living plan for the IISWC 2026 characterization paper. Read this if you are
 > a fresh instance picking up the `feat/matmul-encoding` branch. Last updated:
 > 2026-05-12 (BMM-III + MOAI Alg 4 + rowenc + lazy-relin everywhere + desilo
-> hoisting unblocked; D7/D8/D9 remain).
+> hoisting unblocked + D7 harness; D8/D9 remain).
 
 ## 1. Context
 
@@ -189,12 +189,56 @@ rotate_batch segfault (Decision #6) currently gates hoisting off
 anyway, so the cached vs hoisted comparison can't go in the paper until
 upstream desilo fixes that.
 
-### D7 — Benchmark harness (~1 day)
-Mirror `matmult/main.go`'s runner pattern: per-encoding shape sweep,
-collect OpCounts + wall-clock + peak HBM (via `nvidia-smi`), emit CSV.
-Live under `benchmarks/matmul_encodings/runners/`. Reuse Negar's
-shape tables from `*_runner.go` so the GPU numbers line up with her
-CPU numbers shape-for-shape.
+### D7 — Benchmark harness (DONE)
+Lives under `benchmarks/matmul_encodings/runners/`:
+
+  * `_common.py` — `BenchResult` dataclass, `bench_kernel()` (warmup +
+    timed loop, op-count snapshot, nvidia-smi HBM sample on `--device gpu`),
+    `write_csv()`, and `make_context()` (LogN=13 ConjugateInvariant; same
+    config as the test suite — see slot-count caveat below).
+  * `shapes.py` — per-kernel shape dataclasses + `smoke` and `paper`
+    presets. `paper` mirrors what each `*_runner.go` actually executes
+    today (uncommented entries).
+  * `kernels.py` — one `bench_<kernel>(ctx, shape, ...) -> BenchResult`
+    per kernel. Inputs built once / encrypted out of the timed region;
+    the timed closure is JUST the kernel call (matches Negar's pattern).
+    Per-kernel verify_fn decrypts the LAST trial and returns max abs
+    error vs numpy.
+  * `__main__.py` — CLI: `--backend`, `--device`, `--preset`,
+    `--kernels`, `--n-trials`, `--warmup`, `--no-verify`, `--output`.
+
+Run examples:
+```bash
+# Quick smoke (one tiny shape per kernel) on the lattigo CPU oracle:
+python -m benchmarks.matmul_encodings.runners \
+    --backend lattigo --preset smoke --n-trials 1 --warmup 0 \
+    --output /tmp/smoke.csv
+
+# Paper-realistic sweep on the desilo GPU target:
+python -m benchmarks.matmul_encodings.runners \
+    --backend desilo --device gpu --preset paper \
+    --output benchmarks/matmul_encodings/results/desilo_gpu_paper.csv
+```
+
+CSV schema: `backend, device, kernel, shape, n_he, n_trials, mean_seconds,
+std_seconds, rotations, ct_ct_muls, ct_pt_muls, peak_hbm_mb, max_abs_err`.
+The output dir `benchmarks/matmul_encodings/results/` is gitignored
+(per-machine output).
+
+**Two follow-ups worth knowing:**
+
+1. **GPU mode requires a CUDA-linked desilofhe build.** The
+   `myenv2`-installed wheel is CPU-only and raises `RuntimeError: Not
+   supported mode` at Context init. Build / install the GPU variant of
+   desilofhe before running `--device gpu`.
+2. **Slot-count semantics differ by backend at LogN=13.** With
+   ConjugateInvariant, `make_context` lands at 8192 slots on both
+   backends in this harness (different from Negar's Go LogN=13 Standard
+   = 4096). Apples-to-apples between our lattigo and desilo, but to
+   compare directly against Negar's CPU baseline numbers (D8) we either
+   need to rerun her Go at matching slot count, or accept the
+   per-rotation cost difference (~2x more slots ≈ ~2x rotation cost) as
+   a documented caveat in the methodology section.
 
 ### D8 — CPU baseline rerun (~0.5 day)
 Build and run `matmul-encoding-material/MatMult/matmult/` on this
