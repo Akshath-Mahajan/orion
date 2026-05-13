@@ -39,6 +39,12 @@ from benchmarks.matmul_encodings.plaintext.moai_plain import (
     moai_diag_col_bsgs,
 )
 from benchmarks.matmul_encodings.plaintext.op_counts import OpCounts
+from benchmarks.matmul_encodings.plaintext.rowenc_plain import (
+    row_pack,
+    row_unpack,
+    rowenc_matmul_plain,
+    theoretical_rowenc_costs,
+)
 from benchmarks.matmul_encodings.plaintext.thor_plain import (
     build_masks_for_kernel,
     decode_batched,
@@ -484,6 +490,61 @@ def test_thor_cc_matmul_tiny():
 
     got = decode_batched(c_vecs, d, n, c, H)
     np.testing.assert_allclose(got, ref, atol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# Row-encoding -- the simplest of the four. Constraint: n must be a power of 2
+# (the log2(n) replication steps need integer shift amounts). Tested at
+# n in {2, 4, 8} which exercises the full algorithm at small enough sizes
+# that everything stays in float64-tight tolerance.
+# ---------------------------------------------------------------------------
+
+
+def test_rowenc_pack_unpack_roundtrip():
+    rng = np.random.default_rng(seed=42)
+    n = 8
+    M = rng.standard_normal((n, n))
+    np.testing.assert_allclose(row_unpack(row_pack(M), n), M, atol=1e-12)
+
+
+@pytest.mark.parametrize("n", [2, 4, 8])
+def test_rowenc_matmul_plain_matches_numpy(n):
+    rng = np.random.default_rng(seed=42)
+    A = rng.standard_normal((n, n))
+    B = rng.standard_normal((n, n))
+
+    C_got, counts = rowenc_matmul_plain(A, B)
+    C_ref = A @ B
+    np.testing.assert_allclose(C_got, C_ref, atol=1e-10)
+
+    # Sanity: the kernel did n ct*ct multiplies and 2n ct*pt extractions.
+    assert counts.ct_ct_muls == n
+    assert counts.ct_pt_muls == 2 * n
+
+
+def test_rowenc_op_counts_match_theoretical():
+    """Multiplicative op counts match the closed-form formula exactly.
+
+    Rotation counts are <= the theoretical bound: the runtime counter
+    skips identity rotations (the i=0 initial-align in replicate_row, and
+    the i=0 diagonal-align), saving exactly 2 rotations per matmul.
+    """
+    for n in (2, 4, 8):
+        n_rot_th, n_pmult_th, n_mult_th, _, _ = theoretical_rowenc_costs(n)
+
+        rng = np.random.default_rng(seed=7)
+        A = rng.standard_normal((n, n))
+        B = rng.standard_normal((n, n))
+        _, counts = rowenc_matmul_plain(A, B)
+
+        assert counts.ct_pt_muls == n_pmult_th, n
+        assert counts.ct_ct_muls == n_mult_th, n
+        # Runtime counter skips the two identity rotations at i=0
+        # (replicate_row initial align, diagonal align). Everything else
+        # matches the theoretical bound.
+        assert counts.rotations == n_rot_th - 2, (
+            n, counts.rotations, n_rot_th
+        )
 
 
 def test_thor_cc_matmul_bigger():
