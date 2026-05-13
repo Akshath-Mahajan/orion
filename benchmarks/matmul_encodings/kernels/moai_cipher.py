@@ -23,8 +23,20 @@ BSGS structure (matmult/moai_plain.go moai_col_col_bsgs):
             rolled  = Rot(partial, alpha*b * stride) if alpha != 0
             out[j] += rolled
 
-This first port uses eager relinearization (mul_rl) like the BMM-I /
-THOR kernels in this branch; lazy-relin is a follow-up optimization.
+Lazy relinearization
+--------------------
+Both algorithms accumulate degree-2 ciphertexts inside each (alpha, r)
+block via ctx.mul_nr, then relinearize ONCE just before the final-shift
+rotation (rotation requires degree-1). Net cost per (alpha, r) block:
+d_prime mul_nr's + 1 relin instead of d_prime mul_rl's. Savings:
+(d_prime - 1) relins per block, * b * g blocks per matmul, * d_prime
+output ciphertexts.
+
+On desilo this is real (binding has MulNoRelinCiphertextNew +
+RelinearizeNew). On lattigo it degrades to eager via the binding
+fallback (mul_nr -> mul_rl, relin -> no-op); same numerical result, no
+speedup -- which is fine since the CPU baseline (D8) uses Negar's Go
+binary directly.
 
 Hoisting is applied to the baby-step rotations (one ctx.rot_batch per
 i across (b-1) shifts). The giant-step rotation is a single rotation
@@ -118,13 +130,18 @@ def moai_col_col_bsgs_he(
             if j >= m:
                 break
 
-            # Inner accumulator: partial = sum_i Q_rot[i] * K_baby[i][r]
-            partial = ctx.mul_rl(q_rot[0], beta[0][r])
+            # Lazy: accumulate the d_prime ct*ct products at degree-2,
+            # then relinearize ONCE before either the rotation or the
+            # cross-alpha accumulation. Both rotation and add-with-out_cts
+            # require degree-1 (out_cts stays degree-1 throughout).
+            partial = ctx.mul_nr(q_rot[0], beta[0][r])
             partial = ctx.rescale(partial)
             for i in range(1, d_prime):
-                prod = ctx.mul_rl(q_rot[i], beta[i][r])
+                prod = ctx.mul_nr(q_rot[i], beta[i][r])
                 prod = ctx.rescale(prod)
                 partial = ctx.add(partial, prod)
+
+            partial = ctx.relin(partial)
 
             final_shift = (shift * rot_stride) % n_he
             if final_shift != 0:
@@ -221,7 +238,9 @@ def moai_diag_col_bsgs_he(
             shift = (alpha * b) % m
             c_rot_shift = ((m - shift) * rot_stride) % n_he
 
-            # Inner accumulator: inner = sum_r Rot(C[idx], c_rot_shift) * beta[r]
+            # Lazy: accumulate the inner products at degree-2, then
+            # relinearize ONCE before either the rotation or the
+            # cross-alpha accumulation. out_cts[j] stays degree-1.
             inner: int | None = None
             for r in range(b):
                 idx = alpha * b + r
@@ -233,11 +252,13 @@ def moai_diag_col_bsgs_he(
                 else:
                     rot_c = ctx.rot(C_cts[idx], c_rot_shift)
 
-                prod = ctx.mul_rl(rot_c, beta[r])
+                prod = ctx.mul_nr(rot_c, beta[r])
                 prod = ctx.rescale(prod)
                 inner = prod if inner is None else ctx.add(inner, prod)
 
             assert inner is not None  # at least r=0 ran
+
+            inner = ctx.relin(inner)
 
             final_shift = (shift * rot_stride) % n_he
             if final_shift != 0:
