@@ -190,10 +190,27 @@ the end. Re-run the oracle tests to confirm bit-equivalence. Re-run
 benchmarks to quantify the speedup (this is one of the paper's
 data points). Defer if time-constrained.
 
-Current status across the four kernels:
-- **BMM-I, BMM-III**: lazy on desilo (real `MulNoRelinCiphertextNew`),
-  fall back to eager on lattigo (binding lacks the verb).
-- **THOR, MOAI**: still source-level eager — needs the swap.
+**Current lazy-relin status across the four kernels:**
+
+| Kernel  | Source uses              | Effective on desilo (GPU)  | Effective on lattigo (CPU oracle) |
+|---------|--------------------------|----------------------------|------------------------------------|
+| BMM-I   | `mul_nr` + final `relin` | **Lazy** (real)            | Eager (binding fallback)           |
+| BMM-III | `mul_nr` + finalize relin | **Lazy** (real)           | Eager (binding fallback)           |
+| THOR    | `mul_rl` (eager)         | Eager                      | Eager                              |
+| MOAI    | `mul_rl` (eager)         | Eager                      | Eager                              |
+
+So lazy-relin is **half-implemented**:
+- BMM-I and BMM-III are genuinely lazy on desilo — the binding has
+  `MulNoRelinCiphertextNew` and `RelinearizeNew`, so products land as
+  deg-2 ciphertexts, accumulate at deg-2, and pay one relin per output
+  chunk instead of one per multiply.
+- THOR and MOAI still call `ctx.mul_rl` directly. This is the swap the
+  optimization pass is for. Negar's Go has lazy variants
+  (`ThorCCMatMulHELazyRelin`, MOAI's deferred-relin path) to crib from.
+- Lattigo always degrades to eager because the binding lacks both
+  verbs (`Context.mul_nr` → `MulRelinCiphertextNew`, `ctx.relin` → no-op).
+  Irrelevant if D8 uses Negar's Go binary for the CPU baseline; matters
+  only if we ever measure lattigo through our Python wrapper.
 
 ### Open thread — figure out hoisting
 **Today, the entire suite runs without hoisted rotations on either
