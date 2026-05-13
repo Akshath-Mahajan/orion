@@ -4,6 +4,10 @@
 > first if you're a fresh Claude picking up after he reconnects.
 > [`PLAN.md`](PLAN.md) is the canonical long-term plan; this doc only
 > captures what's specific to handing off across sessions.
+>
+> **Last updated 2026-05-13 ~07:30**: CPU baseline sweep finished
+> cleanly (12 rows, 6h30m). See "Background sweep" section for the
+> numbers and the next-step menu Akshath was asked.
 
 ## TL;DR for the next instance
 
@@ -71,31 +75,73 @@ chronological order on the branch graph:
    and `run.sh` re-applies them to a fresh matmul-encoding-material/
    clone on demand.
 
-## Background sweep (status check first thing on reconnect)
+## Background sweep — DONE (2026-05-13 00:34 → 07:03, 6h30m)
 
-Akshath disconnected after starting a CPU-baseline sweep under tmux.
-Quick health checks:
+The CPU-baseline sweep that the prior Claude launched under
+`tmux new-session -d -s cpu-baseline-d8` ran to completion. Final
+log line:
+
+    === cpu-baseline-d8 sweep ended Wed May 13 07:03:54 AM EDT 2026 (elapsed 23387s) ===
+    === final CSV: 12 rows ===
+
+The tmux session is empty / sweep process has exited. To clean up:
 
 ```bash
-tmux ls                                                          # session alive?
-tmux capture-pane -t cpu-baseline-d8 -p | tail -25               # current activity
-tail -50 /home/avm6288/orion/benchmarks/matmul_encodings/results/cpu_baseline_paper.log
-wc -l    /home/avm6288/orion/benchmarks/matmul_encodings/results/cpu_baseline_paper.csv
-ps -o pid,etime,cmd -p $(pgrep -f matmult_runner | head -1) 2>/dev/null
+tmux kill-session -t cpu-baseline-d8 2>/dev/null
 ```
 
-The sweep started 2026-05-13 00:34. Expected total wall-clock
-~3-5 hours from then because of the 2048-class THOR + MOAI shapes and
-the (1024,1027,1025) BMM-III shape (which alone took 31.6 min).
+(Optional — leaving it idle costs nothing.)
 
-**Expected final CSV:** ~12 rows: 4 rowenc + 4 bmm3 + 1 thor + 1 moai
-(possibly +1 if both Alg 3 and Alg 4 run) + 1 bmm1.
+### Results (single trial, no warmup, all max_err < 1e-5 except thor + bmm1)
 
-If the sweep finished and the CSV looks good, the next step is **D9**.
-If it failed mid-way, look at `cpu_baseline_paper.log` for the panic /
-error and either re-launch the failed suite alone (each menu option is
-independent) or shrink the offending shape table in
-`matmul-encoding-material/MatMult/matmult/<kernel>_runner.go`.
+CSV at `benchmarks/matmul_encodings/results/cpu_baseline_paper.csv`
+(gitignored — regenerate via `cpu_baseline/run.sh`):
+
+| kernel    | shape                                | mean (s)    | max_err  | notes |
+|-----------|--------------------------------------|------------:|----------|-------|
+| rowenc    | n=4                                  | 0.16        | 1.5e-08  |       |
+| rowenc    | n=8                                  | 0.39        | 3.2e-08  |       |
+| rowenc    | n=16                                 | 1.00        | 7.2e-08  |       |
+| rowenc    | n=32                                 | 2.29        | 1.2e-07  |       |
+| bmm3      | (128,131,129)                        | 8.35        | 4.5e-08  |       |
+| bmm3      | (256,259,257)                        | 47.24       | 6.2e-08  |       |
+| bmm3      | (512,515,513)                        | 303.65      | 1.1e-07  |       |
+| bmm3      | (1024,1027,1025)                     | 1896.83     | 9.9e-08  |       |
+| **thor**  | d=2048,n=2048,H=1,s=4096,c=2         | **17610.44**| 6.6e-06  | 4h53m — dominates everything |
+| moai_alg3 | batch=2,m=2048,d'=2048,bsgs=true     | 2604.04     | 3.1e-08  |       |
+| bmm1      | (516,540,528)/blk(43,45,44)          | 605.34      | 2.2e-06  |       |
+
+**Headline observations the paper can lean on:**
+
+- THOR is **6-7x slower than MOAI** at the same size (17610s vs 2604s
+  at d=n=2048, H=1). On CPU that's the lots-of-mask-PMults profile
+  biting hard. The "GPU ranking inverts" thesis predicts THOR closes
+  the gap (or wins) once rotations become bandwidth-bound on GPU.
+- BMM-III scales ~5-6x per shape doubling (8 → 47 → 304 → 1897s).
+  Clean exponential — fits a regression for extrapolation if the
+  paper wants to project to shapes too big to actually run.
+- Errors are tight everywhere except THOR (6.6e-06) and BMM-I
+  (2.2e-06). THOR's depth-2 BSGS structure accumulates more noise
+  than BMM-III's (which sits at ~1e-07).
+
+### What's NOT in the CSV (read before D9)
+
+- **No `moai_alg4` row.** Negar's `MoaiCiphertextSuite` only runs
+  `colCol=true` (Alg 3). Adding `RunMoaiHE(..., colCol: false, ...)`
+  in `moai_runner.go` and re-running option 4 would close that gap;
+  budget ~30 min runtime at size=2048.
+- **No multi-trial stdev.** Sweep was `-trials 1` to keep the
+  wall-clock under ~hour-scale per shape. For paper-grade error bars,
+  re-run with `MATMULT_TRIALS=3` (multiplies wall-clock by ~3 — at
+  6h30m baseline, that's ~20h on this box).
+- **No `n_he=8192` runs.** Negar's Go uses LogN=13 Standard → 4096
+  slots; our Python harness uses LogN=13 ConjugateInvariant → 8192
+  slots. The slot-count alignment decision (PLAN.md §6) is still open.
+
+If the sweep had failed mid-way, the recipe is the same per-suite:
+each menu option is independent, so re-launching just the failed
+suite via `echo -e "<opt>\n0" | /tmp/matmult_runner -trials 1 -verify`
+with `BENCH_CSV_OUT` set in append mode gets you back on track.
 
 ## What's left — sorted
 
@@ -106,21 +152,51 @@ independent) or shrink the offending shape table in
   Single Python script under `benchmarks/matmul_encodings/`. Consume
   both the GPU sweep CSV (from `runners/__main__.py`) and the CPU
   sweep CSV (from `cpu_baseline/run.sh`); they share the same schema.
+  CPU CSV is now ready — see "Background sweep" above.
 - **GPU-enabled desilofhe build** — blocking for actual GPU numbers.
   The `myenv2` wheel is CPU-only; `--device gpu` aborts with
-  `RuntimeError: Not supported mode`. Until this is resolved, the GPU
-  side of the figure has no data. Akshath needs to install / build
-  the CUDA variant or switch envs.
+  `RuntimeError: Not supported mode`. Everything else GPU-side is
+  ready: every kernel is implemented against the desilo backend,
+  every kernel runs hoisting + lazy-relin on desilo, the Python
+  harness has `--device gpu` wired through, and the harness samples
+  HBM via nvidia-smi when device=gpu. The ONLY missing piece is the
+  CUDA-built desilofhe wheel/binary. Akshath needs to install or
+  build it (or swap to a different env that already has it).
 - **Slot-count alignment decision** (~0.1 day). Negar's Go uses LogN=13
   Standard → 4096 slots; our Python harness uses LogN=13
   ConjugateInvariant → 8192 slots. Either rerun Negar's Go at
   matching slot count (edit `init_lattigo.go::DefaultParams`) or
   document the ~2× per-rotation cost difference in the methodology.
-  Decide once D8 numbers are in.
+  Decide once GPU numbers are in (the figure makes the choice
+  obvious one way or the other).
 - **Final regression check** (~0.1 day).
   `/example-test-mm-encodings` on LoLA / MLP / ResNet vs
   `examples/results/` transcripts. Catches slow regressions in the
   inference paths from binding/kernel work.
+
+### Decision the prior Claude left for the next instance
+
+After the sweep finished, Akshath was given three options for what to
+do next (no answer recorded yet — ask him on reconnect):
+
+  - **(a)** Move on to D9 (figure script) using just CPU numbers + a
+    "GPU TBD" placeholder. Unblocks the figure layout work; can drop
+    GPU bars in once the desilofhe-CUDA install lands.
+  - **(b)** First investigate the desilofhe-CUDA install path
+    (`pip search`, the desilofhe upstream repo's install docs, see
+    if there's a separate `desilofhe-gpu` package, etc.). Highest
+    paper value but uncertain how long it takes — could be 5 minutes
+    or several hours depending on what's available.
+  - **(c)** Add MOAI Algorithm 4 to Negar's Go runner so we get the
+    full Q·Kᵀ·V chain numbers on CPU (~30 min runtime at size=2048)
+    before D9. Closes the only gap in the CPU CSV, useful only if
+    the figure / paper plans to show MOAI's chained-matmul story
+    explicitly.
+
+Recommendation: probably **(b) → (a)** in that order. Without GPU
+numbers the figure has half its data; the install is on the critical
+path and shouldn't be deferred. (c) is a small follow-up that can
+slot in after.
 
 **Open follow-ups (paper-irrelevant unless flagged):**
 
