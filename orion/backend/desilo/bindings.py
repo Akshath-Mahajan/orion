@@ -26,6 +26,9 @@ class DeSiLoLibrary:
         self._rk = None
         self._rot_key = None
         self._conj_key = None
+        # Per-delta FixedRotationKey cache for the safe rotate_batch path
+        # (see RotateBatchNew). Built lazily; lives until DeleteScheme.
+        self._fixed_rot_keys: dict[int, "desilofhe.FixedRotationKey"] = {}
 
         # Scheme params
         self._default_scale = None
@@ -127,6 +130,7 @@ class DeSiLoLibrary:
         self._rk = None
         self._rot_key = None
         self._conj_key = None
+        self._fixed_rot_keys.clear()
         self.engine = None
 
     def FreeCArray(self, ptr=None):
@@ -305,47 +309,41 @@ class DeSiLoLibrary:
         Equivalent to ``[RotateNew(ct_id, k) for k in ks]``. Returns a
         list of new ciphertext IDs in the same order as ``ks``.
 
-        Implementation note (desilofhe v1.11.2 segfault workaround):
-        ``engine.rotate_batch`` is unstable and segfaults on certain
-        delta combinations — confirmed crashers include any list
-        containing a negative delta, and lists of large non-consecutive
-        positive deltas like ``[8191, 8187, 8175]`` (= ``-1, -5, -17``
-        mod 8192). Lists of small consecutive positive deltas work up
-        to N=8000+.
+        Implementation note (desilofhe overload selection):
+        ``engine.rotate_batch`` has two overloads —
 
-        To keep this binding safe in all paths, we use the hoisted
-        engine.rotate_batch only when every delta lies in the proven
-        safe range, and otherwise fall back to individual engine.rotate
-        calls (same result, no hoisting amortization). The API surface
-        is identical; the only observable difference is performance.
+          (1) (ct, RotationKey, list[int])           ← deltas-based
+          (2) (ct, list[FixedRotationKey])           ← per-delta keys
 
-        TODO: file with desilo and re-enable batched path unconditionally
-        once it stabilizes.
+        Overload (1) is unstable: segfaults on negative deltas, on large
+        non-consecutive positives like ``[8191, 8187, 8175]``, and on
+        positive batches with mid-range stride like
+        ``[5, 10, 15, 20, 25, 30]`` — including the patterns BSGS / BMM-I
+        actually use.
+
+        Overload (2) is robust across every pattern we tested
+        (small/mid/large positive, negative, mixed signs, sorted /
+        unsorted, lengths 2-15+). We use it unconditionally here, with a
+        per-delta FixedRotationKey cache so key generation is paid once
+        per distinct delta per scheme, not once per call.
         """
         ct = self._get(ct_id)
         scale = self._scales.get(ct_id, self._default_scale)
-        slots = self._slots
 
-        # Safe-pattern detection: all deltas in (0, slots/2) and the
-        # batch is "well-behaved" (consecutive or near-consecutive in
-        # the Orion / Lattigo convention, before negation for desilo).
-        # In practice, BSGS baby-step rotations sit at k = 1..sqrt(N),
-        # which after Orion's -k negation lands at large negatives.
-        # That pattern segfaults today, so we currently never take the
-        # hoisted path. Keep the gate so we can flip it later.
-        all_safe = False  # disabled until upstream fix
-
-        if all_safe:
-            deltas = [-int(k) for k in ks]
-            results = self.engine.rotate_batch(ct, self._rot_key, deltas)
-            return [self._store(r, "ct", scale=scale) for r in results]
-
-        # Fallback: individual rotates (same semantics, no hoisting).
-        out_ids = []
+        # Build / fetch per-delta fixed rotation keys.
+        # Orion convention is opposite to desilofhe: Orion `RotateNew(ct, k)`
+        # = desilofhe `rotate(ct, key, delta=-k)`, so we negate here too.
+        keys = []
         for k in ks:
-            r = self.engine.rotate(ct, self._rot_key, delta=-int(k))
-            out_ids.append(self._store(r, "ct", scale=scale))
-        return out_ids
+            d = -int(k)
+            key = self._fixed_rot_keys.get(d)
+            if key is None:
+                key = self.engine.create_fixed_rotation_key(self._sk, d)
+                self._fixed_rot_keys[d] = key
+            keys.append(key)
+
+        results = self.engine.rotate_batch(ct, keys)
+        return [self._store(r, "ct", scale=scale) for r in results]
 
     # ------------------------------------------------------------------
     #  Negate
