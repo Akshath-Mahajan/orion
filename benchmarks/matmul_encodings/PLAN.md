@@ -190,6 +190,33 @@ the end. Re-run the oracle tests to confirm bit-equivalence. Re-run
 benchmarks to quantify the speedup (this is one of the paper's
 data points). Defer if time-constrained.
 
+Current status across the four kernels:
+- **BMM-I, BMM-III**: lazy on desilo (real `MulNoRelinCiphertextNew`),
+  fall back to eager on lattigo (binding lacks the verb).
+- **THOR, MOAI**: still source-level eager — needs the swap.
+
+### Open thread — figure out hoisting
+**Today, the entire suite runs without hoisted rotations on either
+backend.** Desilo's `engine.rotate_batch` segfaults on the access
+patterns BSGS / LongRot actually use (PLAN.md §5 reproducer), so
+`RotateBatchNew` is hard-gated to a Python loop of individual rotates
+(`all_safe = False`, [orion/backend/desilo/bindings.py:336]). The
+lattigo binding has no `RotateBatchNew` at all, so `Context.rot_batch`
+loops there too. All four kernels CALL `ctx.rot_batch` for their
+hoistable shifts — flipping these gates would re-enable hoisting
+suite-wide with zero kernel changes.
+
+This matters for the paper's headline claim: "GPU ranking inverts vs
+CPU because rotations are bandwidth-bound on GPU" assumes hoisting is
+on at both ends. Without it, GPU is forced into N independent
+key-switches per logical batch, which inflates the GPU rotation cost
+artificially in our favour. Need to either (a) get hoisting working on
+desilo before May 21, or (b) explicitly note in the methodology that
+GPU numbers are pre-hoisting and argue the inversion still holds. Path
+(a) requires either a desilo upstream fix or a workaround in our
+binding; path (b) is a writing problem. Punt the choice until D8 has
+real numbers to look at, but don't forget.
+
 ### Final regression check
 `/example-test-mm-encodings` on LoLA/MLP/ResNet against the
 `examples/results/` transcripts. Already passed once at `2810dee` for
