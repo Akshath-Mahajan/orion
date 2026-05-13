@@ -66,12 +66,17 @@ class Context:
 
         If ``values`` is shorter than ``slots``, it is zero-padded.
         Returns a plaintext id.
+
+        Note: backends expect a Python list (Lattigo's ctypes wrapper
+        only auto-expands list[float] -> (ptr, len); a np.ndarray of
+        float64 falls through and crashes with "takes 4 args"). Pass a
+        list to keep both backends happy.
         """
         if level is None:
             level = self.max_level
         scale = self.scheme.params.get_default_scale()
         padded = self._pad(values)
-        return self.backend.Encode(padded, level, scale)
+        return self.backend.Encode(padded.tolist(), level, scale)
 
     def encrypt(self, values: np.ndarray, level: int | None = None) -> int:
         """Encode + encrypt; returns a ciphertext id."""
@@ -94,14 +99,21 @@ class Context:
         return self.backend.RotateNew(ct_id, int(k))
 
     def rot_batch(self, ct_id: int, ks: Sequence[int]) -> list[int]:
-        """Hoisted N-way rotation. Increments counts.rotations by len(ks).
+        """Hoisted N-way rotation. Increments counts.rotations by the
+        number of non-zero deltas.
 
-        Currently falls back to N individual rotates inside the binding
-        (desilo segfault workaround); see RotateBatchNew docstring.
+        Backend dispatch:
+        - desilo exposes ``RotateBatchNew`` (with a segfault-safe fallback
+          to individual rotates today).
+        - lattigo does not expose batched rotation; we issue N individual
+          ``RotateNew`` calls in a loop, matching the same semantics.
         """
+        ks = list(ks)
         non_zero = [k for k in ks if k % self.slots != 0]
         self.counts.rotations += len(non_zero)
-        return self.backend.RotateBatchNew(ct_id, list(ks))
+        if hasattr(self.backend, "RotateBatchNew"):
+            return self.backend.RotateBatchNew(ct_id, ks)
+        return [self.backend.RotateNew(ct_id, int(k)) for k in ks]
 
     def add(self, ct1: int, ct2: int) -> int:
         return self.backend.AddCiphertextNew(ct1, ct2)
@@ -115,17 +127,31 @@ class Context:
         return self.backend.MulRelinCiphertextNew(ct1, ct2)
 
     def mul_nr(self, ct1: int, ct2: int) -> int:
-        """ct1 * ct2 leaving a degree-2 ciphertext (lazy relin). Bumps ct_ct_muls."""
+        """ct1 * ct2 leaving a degree-2 ciphertext (lazy relin). Bumps ct_ct_muls.
+
+        Falls back to eager-relin (MulRelinCiphertextNew) when the backend
+        lacks ``MulNoRelinCiphertextNew``. Result is numerically identical
+        -- the only observable difference is that eager-relin pays an
+        extra key-switch per multiply.
+        """
         self.counts.ct_ct_muls += 1
-        return self.backend.MulNoRelinCiphertextNew(ct1, ct2)
+        if hasattr(self.backend, "MulNoRelinCiphertextNew"):
+            return self.backend.MulNoRelinCiphertextNew(ct1, ct2)
+        return self.backend.MulRelinCiphertextNew(ct1, ct2)
 
     def relin(self, ct_id: int) -> int:
         """Standalone relinearization (used after a chain of mul_nr + adds).
 
         Does NOT bump ct_ct_muls -- the multiply that produced the
         degree-2 ciphertext already did.
+
+        No-op fallback on backends without ``RelinearizeNew``: if mul_nr
+        fell back to eager relin, the ciphertext is already degree-1, so
+        relin is a meaningless extra step we skip.
         """
-        return self.backend.RelinearizeNew(ct_id)
+        if hasattr(self.backend, "RelinearizeNew"):
+            return self.backend.RelinearizeNew(ct_id)
+        return ct_id
 
     def mul_pt(self, ct_id: int, pt_id: int) -> int:
         """ct * pt. Bumps ct_pt_muls."""
