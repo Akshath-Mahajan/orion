@@ -298,6 +298,55 @@ class DeSiLoLibrary:
         scale = self._scales.get(ct_id, self._default_scale)
         return self._store(result, "ct", scale=scale)
 
+    def RotateBatchNew(self, ct_id, ks):
+        """Hoisted batch rotation: produce N rotated ciphertexts from one
+        input, amortizing the ModUp / decomposition phase of key-switching.
+
+        Equivalent to ``[RotateNew(ct_id, k) for k in ks]``. Returns a
+        list of new ciphertext IDs in the same order as ``ks``.
+
+        Implementation note (desilofhe v1.11.2 segfault workaround):
+        ``engine.rotate_batch`` is unstable and segfaults on certain
+        delta combinations — confirmed crashers include any list
+        containing a negative delta, and lists of large non-consecutive
+        positive deltas like ``[8191, 8187, 8175]`` (= ``-1, -5, -17``
+        mod 8192). Lists of small consecutive positive deltas work up
+        to N=8000+.
+
+        To keep this binding safe in all paths, we use the hoisted
+        engine.rotate_batch only when every delta lies in the proven
+        safe range, and otherwise fall back to individual engine.rotate
+        calls (same result, no hoisting amortization). The API surface
+        is identical; the only observable difference is performance.
+
+        TODO: file with desilo and re-enable batched path unconditionally
+        once it stabilizes.
+        """
+        ct = self._get(ct_id)
+        scale = self._scales.get(ct_id, self._default_scale)
+        slots = self._slots
+
+        # Safe-pattern detection: all deltas in (0, slots/2) and the
+        # batch is "well-behaved" (consecutive or near-consecutive in
+        # the Orion / Lattigo convention, before negation for desilo).
+        # In practice, BSGS baby-step rotations sit at k = 1..sqrt(N),
+        # which after Orion's -k negation lands at large negatives.
+        # That pattern segfaults today, so we currently never take the
+        # hoisted path. Keep the gate so we can flip it later.
+        all_safe = False  # disabled until upstream fix
+
+        if all_safe:
+            deltas = [-int(k) for k in ks]
+            results = self.engine.rotate_batch(ct, self._rot_key, deltas)
+            return [self._store(r, "ct", scale=scale) for r in results]
+
+        # Fallback: individual rotates (same semantics, no hoisting).
+        out_ids = []
+        for k in ks:
+            r = self.engine.rotate(ct, self._rot_key, delta=-int(k))
+            out_ids.append(self._store(r, "ct", scale=scale))
+        return out_ids
+
     # ------------------------------------------------------------------
     #  Negate
     # ------------------------------------------------------------------
