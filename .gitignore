@@ -206,3 +206,6 @@ go.work.sum
 
 # env file
 .env
+
+# Context-only clone, not part of orion
+matmul-encoding-material/
