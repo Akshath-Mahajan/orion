@@ -23,7 +23,10 @@ from benchmarks.matmul_encodings.plaintext.bmm1_plain import (
     rotate_vec,
 )
 from benchmarks.matmul_encodings.plaintext.bmm3_plain import (
+    bmm3_matmul_plain,
+    bmm3_plain,
     break_into_chunks,
+    long_rot_plain,
     smallest_r,
 )
 from benchmarks.matmul_encodings.plaintext.moai_plain import (
@@ -217,6 +220,124 @@ def test_break_into_chunks_no_tiling_needed():
     chunks = break_into_chunks(enc, len(enc), output_len, n_he)
     flat = np.concatenate(chunks)
     np.testing.assert_array_equal(flat[: len(enc)], enc)
+
+
+# ---------------------------------------------------------------------------
+# BMM-III LongRot simulator -- the chunked rotation MUST equal a plain
+# logical-vector rotation followed by chunking. This is the invariant that
+# pins the LongRot algorithm to its specification, independent of any
+# matmul wiring.
+# ---------------------------------------------------------------------------
+
+
+def _logical_long_rot_reference(
+    chunks: list[np.ndarray], rot: int, output_len: int, enc_len: int, n_he: int
+) -> np.ndarray:
+    """The simplest possible LongRot reference: reconstruct the full logical
+    encoded vector, rotate it by `rot`, take the first `output_len` slots."""
+    work = np.concatenate(chunks)
+    enc = work[:enc_len]
+    needed = output_len + n_he
+    if enc_len < needed:
+        reps = ((needed + enc_len - 1) // enc_len) + 1
+        enc = np.tile(enc, reps)
+    rotated = np.concatenate([enc[rot % len(enc):], enc[: rot % len(enc)]])
+    return rotated[:output_len]
+
+
+@pytest.mark.parametrize(
+    "enc_len, output_len, n_he, rot",
+    [
+        # Single-chunk case: enc_len <= n_he, identity rotation.
+        (12, 12, 16, 0),
+        (12, 12, 16, 5),
+        # Multi-chunk, fits in a few tiles, mid-chunk rotation.
+        (35, 55, 16, 0),    # rot=0 baseline
+        (35, 55, 16, 7),    # v_tmp != 0, normal stitch
+        (35, 55, 16, 16),   # v_tmp == 0, u-shift only
+        (35, 55, 16, 17),   # v_tmp != 0 across chunk boundary
+        (35, 55, 16, 30),   # large rot -- exercises Step 1 advance + 3-way
+        # Bigger enc_len, no tiling, several output chunks.
+        (77, 55, 16, 0),
+        (77, 55, 16, 13),
+        (77, 55, 16, 33),
+        # Mixed: enc_len % n_he == 0 (no last-chunk padding).
+        (32, 32, 16, 5),
+        (32, 32, 16, 16),
+    ],
+)
+def test_long_rot_plain_matches_logical_rotation(
+    enc_len, output_len, n_he, rot
+):
+    """`long_rot_plain` must reproduce the logical vector rotation across
+    every Step-1/2/3 branch we exercise."""
+    rng = np.random.default_rng(seed=42)
+    raw = rng.standard_normal(enc_len)
+    chunks = break_into_chunks(raw, enc_len, output_len, n_he)
+
+    out_chunks = long_rot_plain(chunks, rot, output_len, enc_len, n_he)
+    got = np.concatenate(out_chunks)[:output_len]
+    want = _logical_long_rot_reference(chunks, rot, output_len, enc_len, n_he)
+
+    np.testing.assert_allclose(got, want, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# BMM-III plaintext kernel -- the encoding-aware matmul oracle that the
+# CKKS BMM-III kernel will be checked against. Single-chunk (n*m,m*p<=n_he)
+# AND multi-chunk shapes both have to land within float64 epsilon.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "n, m, p, n_he",
+    [
+        # Single-chunk fallback: n*m, m*p <= n_he (BMM-III reduces to BMM-I).
+        (5, 7, 11, 128),
+        # Multi-chunk: n*m and m*p exceed n_he -- the "real" BMM-III path.
+        (5, 7, 11, 16),
+        (4, 5, 7, 16),
+        (8, 9, 11, 32),
+        # Coprime triple with all three dims > 1 chunk after tiling.
+        (7, 11, 13, 32),
+    ],
+)
+def test_bmm3_matmul_plain_matches_numpy(n, m, p, n_he):
+    rng = np.random.default_rng(seed=42)
+    A = rng.standard_normal((n, m))
+    B = rng.standard_normal((m, p))
+
+    C_got, counts = bmm3_matmul_plain(A, B, n_he)
+    C_ref = A @ B
+
+    np.testing.assert_allclose(C_got, C_ref, atol=1e-10)
+
+    # Sanity: the kernel did the right amount of multiplicative work.
+    stop = (n * p + n_he - 1) // n_he
+    assert counts.ct_ct_muls == m * stop
+
+
+def test_bmm3_plain_op_counts_grow_as_chunks_shrink():
+    """Smaller n_he -> more chunks -> strictly more LongRot work.
+
+    break_into_chunks always tiles to support the worst-case rotation
+    window, so genuine single-chunk fallback (w==1, rotations==0) is not
+    reachable with the algorithm's encode_len + n_he window. What we can
+    verify is monotonicity in the chunk count.
+    """
+    rng = np.random.default_rng(seed=7)
+    n, m, p = 5, 7, 11
+    A = rng.standard_normal((n, m))
+    B = rng.standard_normal((m, p))
+
+    _, big_chunks = bmm3_matmul_plain(A, B, n_he=128)
+    _, small_chunks = bmm3_matmul_plain(A, B, n_he=16)
+
+    assert small_chunks.rotations  > big_chunks.rotations
+    assert small_chunks.ct_pt_muls > big_chunks.ct_pt_muls
+    # ct_ct_muls counts m * stop and stop = ceil(n*p / n_he); shrinking
+    # n_he shouldn't decrease it either.
+    assert small_chunks.ct_ct_muls >= big_chunks.ct_ct_muls
 
 
 # ---------------------------------------------------------------------------
