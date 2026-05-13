@@ -18,10 +18,19 @@ Kernel sketch:
     accumulate via four routing masks mu0/mu1/mu2/mu3, then
     res[j] = p_cjl[j][0] + acc_prime[j] + Rot(acc_d_prime[j], -nH)
 
-This first port uses eager relinearization. A later commit can swap
-the ct.ct multiplies for ctx.mul_nr + a single relin at the end to
-recover the lazy-relin speedup (Negar's ThorCCMatMulHELazyRelin path);
-the kernel logic is unchanged, only the binding verbs differ.
+Lazy relinearization (matches Negar's ThorCCMatMulHELazyRelin):
+  * Each ct*ct multiply uses ctx.mul_nr, leaving a degree-2 product.
+  * acc_prime / acc_d_prime accumulate at degree-2 (mul_pt and add
+    preserve degree). The base term p_cjl[j][0] is also degree-2.
+  * Final assembly:
+      - merge base + acc_prime at degree-2, relinearize ONCE -> degree-1.
+      - relinearize acc_d_prime ONCE -> degree-1.
+      - rotate the relinearized acc_d_prime (rotation requires degree-1).
+  * Net cost: m_c * n ct*ct multiplies pay only 2 * m_c relins instead
+    of m_c * n. On desilo this is real (binding has MulNoRelinCiphertextNew
+    + RelinearizeNew). On lattigo it degrades to eager via the binding
+    fallback (mul_nr -> mul_rl, relin -> no-op); same numerical result,
+    no speedup.
 """
 
 from __future__ import annotations
@@ -169,10 +178,11 @@ def thor_cc_matmul_he(
     )
 
     # Lines 4-8 of Algorithm 2: build all p_cjl[j][ell] products.
+    # Lazy: mul_nr leaves each product as a degree-2 ciphertext.
     p_cjl: list[list[int | None]] = [[None] * n for _ in range(mc)]
     for j in range(mc):
         # ell=0 product (no rotation)
-        prod = ctx.mul_rl(p_as_cts[j], p_b_rep_cts[0])
+        prod = ctx.mul_nr(p_as_cts[j], p_b_rep_cts[0])
         prod = ctx.rescale(prod)
         p_cjl[j][0] = prod
 
@@ -180,11 +190,12 @@ def thor_cc_matmul_he(
         shifts = [((-n) * (ell % c) + ell) * H for ell in range(1, n)]
         rotated = ctx.rot_batch(p_as_cts[j], shifts)
         for ell, rot_ct in zip(range(1, n), rotated):
-            prod = ctx.mul_rl(rot_ct, p_b_rep_cts[ell])
+            prod = ctx.mul_nr(rot_ct, p_b_rep_cts[ell])
             prod = ctx.rescale(prod)
             p_cjl[j][ell] = prod
 
     # Lines 9-17: masking + accumulation into acc_prime / acc_d_prime.
+    # All accumulators stay at degree-2 (mul_pt and add preserve degree).
     acc_prime: list[int | None] = [None] * mc
     acc_d_prime: list[int | None] = [None] * mc
 
@@ -212,19 +223,23 @@ def thor_cc_matmul_he(
             v3 = ctx.rescale(ctx.mul_pt(v, mu3_pt))
             acc_d_prime[j_same] = v3 if acc_d_prime[j_same] is None else ctx.add(acc_d_prime[j_same], v3)
 
-    # Line 18: final assembly. p_cjl[j][0] is at level L-1, accumulators at
-    # L-2. Drop p_cjl[j][0] one level by multiplying by an all-ones plaintext
-    # and rescaling. (No DropLevel verb in either binding.)
+    # Line 18: final assembly. All accumulators are degree-2 at L-2; the
+    # base term is degree-2 at L-1. Drop the base to L-2 by multiplying by
+    # an all-ones plaintext and rescaling (no DropLevel in either binding).
+    # Then merge base + acc_prime, relinearize once. Relinearize acc_d_prime
+    # separately (the rotation in the next step requires degree-1).
     out: list[int] = []
     for j in range(mc):
         base = ctx.rescale(ctx.mul_pt(p_cjl[j][0], ones_pt))
-        res = base
         if acc_prime[j] is not None:
-            res = ctx.add(res, acc_prime[j])
+            base = ctx.add(base, acc_prime[j])
+        base = ctx.relin(base)
+
         if acc_d_prime[j] is not None:
-            rolled = ctx.rot(acc_d_prime[j], -nH)
-            res = ctx.add(res, rolled)
-        out.append(res)
+            acc_d = ctx.relin(acc_d_prime[j])
+            rolled = ctx.rot(acc_d, -nH)
+            base = ctx.add(base, rolled)
+        out.append(base)
     return out
 
 
