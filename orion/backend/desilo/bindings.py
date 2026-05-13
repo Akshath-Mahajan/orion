@@ -443,6 +443,42 @@ class DeSiLoLibrary:
         scale = self._scales.get(ct_id1, self._default_scale)
         return self._store(result, "ct", scale=scale)
 
+    def MulNoRelinCiphertext(self, ct_id1, ct_id2):
+        """ct1 *= ct2 leaving the result as a degree-2 ciphertext.
+
+        Skips the relinearization key-switch. The caller is responsible
+        for a later Relinearize before any operation that requires a
+        degree-1 ciphertext (e.g. another rotation / multiplication).
+        """
+        ct1, ct2 = self._get(ct_id1), self._get(ct_id2)
+        result = self.engine.multiply(ct1, ct2)
+        return self._replace(ct_id1, result)
+
+    def MulNoRelinCiphertextNew(self, ct_id1, ct_id2):
+        """Like MulNoRelinCiphertext but allocates a new ciphertext ID."""
+        ct1, ct2 = self._get(ct_id1), self._get(ct_id2)
+        result = self.engine.multiply(ct1, ct2)
+        scale = self._scales.get(ct_id1, self._default_scale)
+        return self._store(result, "ct", scale=scale)
+
+    def Relinearize(self, ct_id):
+        """Fold a degree-2 ciphertext back to degree 1 via the relin key.
+
+        Equivalent to the second half of MulRelinCiphertext. Use after
+        accumulating MulNoRelin* products (lazy relinearization pattern)
+        to pay one key-switch per output instead of one per term.
+        """
+        ct = self._get(ct_id)
+        result = self.engine.relinearize(ct, self._rk)
+        return self._replace(ct_id, result)
+
+    def RelinearizeNew(self, ct_id):
+        """Like Relinearize but allocates a new ciphertext ID."""
+        ct = self._get(ct_id)
+        result = self.engine.relinearize(ct, self._rk)
+        scale = self._scales.get(ct_id, self._default_scale)
+        return self._store(result, "ct", scale=scale)
+
     # ------------------------------------------------------------------
     #  Polynomial evaluation
     # ------------------------------------------------------------------
