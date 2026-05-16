@@ -110,7 +110,9 @@ class DeSiLoLibrary:
         else:
             print(f"[DeSiLo] Creating engine: target max_level="
                   f"{self._max_level}, slots={self._slots}, device={self._device}")
-            self.engine = desilofhe.Engine(self._max_level, mode=self._device)
+            self.engine = desilofhe.Engine(
+                slot_count=self._slots, max_level=self._max_level,
+                mode=self._device)
 
         print(f"[DeSiLo] Engine ready: max_level={self.engine.max_level}, "
               f"slot_count={self.engine.slot_count}")
