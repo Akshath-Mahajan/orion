@@ -20,18 +20,24 @@ from __future__ import annotations
 
 import dataclasses
 import statistics
-import subprocess
 import time
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
 from benchmarks.matmul_encodings.context import Context
 from benchmarks.matmul_encodings.plaintext.op_counts import OpCounts
+from benchmarks.matmul_encodings.runners.gpu_sampler import GpuMonitor
 
 
 @dataclasses.dataclass
 class BenchResult:
-    """One row of the harness output CSV."""
+    """One row of the harness output CSV.
+
+    GPU columns (``peak_hbm_mb`` onwards) are only populated when the
+    desilo backend runs on ``device=gpu`` and a ``GpuMonitor`` is
+    attached. They are ``None`` otherwise, which CSV writes as the
+    empty string.
+    """
 
     backend: str           # "lattigo" or "desilo"
     device: str            # "cpu" or "gpu"
@@ -44,7 +50,22 @@ class BenchResult:
     rotations: int
     ct_ct_muls: int
     ct_pt_muls: int
-    peak_hbm_mb: float | None  # None for cpu / lattigo runs
+    # GPU measurement columns. peak_hbm_mb is the TRUE peak of our
+    # process's used GPU memory over the timed window (~5ms NVML poll),
+    # NOT the before/after delta the prior implementation reported.
+    peak_hbm_mb: float | None
+    # Per-trial GPU energy (joules). gross is the raw counter delta /
+    # n_trials; kernel_energy_j subtracts (idle_power_w * mean_seconds)
+    # so it approximates the kernel's marginal energy cost above idle.
+    gross_energy_j: float | None
+    kernel_energy_j: float | None
+    # mean_power_w = gross_energy_total / window_seconds. Useful sanity
+    # check (should land between idle and TDP).
+    mean_power_w: float | None
+    # False if any compute PID other than ours was on the GPU during
+    # the timed window. When False, the energy columns above are
+    # overcounted (whole-GPU counter, not per-process attributable).
+    single_tenant: bool | None
     max_abs_err: float | None  # None when verify is disabled
 
     @classmethod
@@ -52,20 +73,10 @@ class BenchResult:
         return [f.name for f in dataclasses.fields(cls)]
 
     def csv_row(self) -> list[str]:
-        return [str(getattr(self, f.name)) for f in dataclasses.fields(self)]
-
-
-def nvidia_smi_used_mb() -> float | None:
-    """Return GPU0 used memory in MB; None if nvidia-smi isn't available."""
-    try:
-        out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.used",
-             "--format=csv,noheader,nounits", "-i", "0"],
-            capture_output=True, text=True, check=True, timeout=2,
-        )
-        return float(out.stdout.strip().split("\n")[0])
-    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        return None
+        return [
+            "" if v is None else str(v)
+            for v in (getattr(self, f.name) for f in dataclasses.fields(self))
+        ]
 
 
 def bench_kernel(
@@ -80,40 +91,50 @@ def bench_kernel(
     n_trials: int = 3,
     warmup: int = 1,
     verify_fn: Callable[[object], float] | None = None,
+    gpu_monitor: GpuMonitor | None = None,
 ) -> BenchResult:
-    """Time `run_fn`, record op counts and (when on GPU) peak HBM.
+    """Time `run_fn`, record op counts, and (when on GPU) peak memory +
+    integrated energy.
 
     Args:
         run_fn: Closure that invokes one kernel call. May return a value
             (typically the decrypted output) for `verify_fn` to consume.
         verify_fn: Optional. Receives the result of the LAST timed call
             and returns max absolute error vs a numpy reference.
+        gpu_monitor: Optional NVML wrapper. When present *and* device is
+            "gpu", the timed window is bracketed by ``gpu_monitor.measure()``
+            which fills in peak_hbm_mb and the energy columns. The
+            monitor's idle baseline (if calibrated) is used to compute
+            kernel_energy_j; otherwise that column is left None.
 
     Returns:
-        BenchResult with mean / std wall-clock, op counts, and HBM delta.
+        BenchResult with mean/std wall-clock, op counts, and (when
+        applicable) GPU memory + energy.
     """
-    # Warmup (untimed). Counts and HBM samples taken AFTER warmup so they
-    # reflect only the timed region.
+    # Warmup (untimed). Counts and GPU samples are taken AFTER warmup
+    # so they reflect only the timed region.
     for _ in range(warmup):
         run_fn()
-
-    # GPU memory baseline (after warmup so any one-shot allocations are out)
-    measure_hbm = (device == "gpu")
-    hbm_before = nvidia_smi_used_mb() if measure_hbm else None
 
     ctx.reset_counts()
 
     times: list[float] = []
     last_result: object | None = None
-    for _ in range(n_trials):
-        t0 = time.perf_counter()
-        last_result = run_fn()
-        times.append(time.perf_counter() - t0)
 
-    hbm_after = nvidia_smi_used_mb() if measure_hbm else None
-    peak_hbm_mb = (hbm_after - hbm_before) if (
-        measure_hbm and hbm_before is not None and hbm_after is not None
-    ) else None
+    measure_gpu = (device == "gpu" and gpu_monitor is not None)
+
+    if measure_gpu:
+        sampler_cm = gpu_monitor.measure(n_trials=n_trials)
+    else:
+        # Null context manager so we can share the body.
+        from contextlib import nullcontext
+        sampler_cm = nullcontext(None)
+
+    with sampler_cm as gpu_sample:
+        for _ in range(n_trials):
+            t0 = time.perf_counter()
+            last_result = run_fn()
+            times.append(time.perf_counter() - t0)
 
     counts: OpCounts = ctx.counts
 
@@ -123,6 +144,16 @@ def bench_kernel(
             max_err = float(verify_fn(last_result))
         except Exception as e:  # verify failure shouldn't kill the row
             print(f"  [warn] verify_fn raised on {kernel}/{shape}: {e}")
+
+    if gpu_sample is None:
+        peak_hbm = gross_e = kern_e = mean_p = None
+        single_tenant = None
+    else:
+        peak_hbm = gpu_sample.peak_hbm_mb
+        gross_e = gpu_sample.gross_energy_j
+        kern_e = gpu_sample.kernel_energy_j
+        mean_p = gpu_sample.mean_power_w
+        single_tenant = gpu_sample.single_tenant
 
     return BenchResult(
         backend=backend,
@@ -138,7 +169,11 @@ def bench_kernel(
         rotations=counts.rotations // n_trials,
         ct_ct_muls=counts.ct_ct_muls // n_trials,
         ct_pt_muls=counts.ct_pt_muls // n_trials,
-        peak_hbm_mb=peak_hbm_mb,
+        peak_hbm_mb=peak_hbm,
+        gross_energy_j=gross_e,
+        kernel_energy_j=kern_e,
+        mean_power_w=mean_p,
+        single_tenant=single_tenant,
         max_abs_err=max_err,
     )
 

@@ -35,6 +35,7 @@ import time
 from pathlib import Path
 
 from ._common import CKKS_PRESETS, BenchResult, make_context, write_csv
+from .gpu_sampler import GpuMonitor
 from .kernels import KERNEL_TABLE
 from .shapes import SHAPE_SETS
 
@@ -92,6 +93,25 @@ def main(argv: list[str] | None = None) -> int:
     ctx = make_context(args.backend, device=args.device, preset=args.ckks_preset)
     print(f"[bench] context: slots={ctx.slots} max_level={ctx.max_level}")
 
+    # GPU monitor setup. Built once per run, idle-calibrated before any
+    # kernel allocates state. ``GpuMonitor.create`` returns None if
+    # pynvml isn't installed or no GPU is visible -- bench_kernel then
+    # silently leaves the GPU columns empty in the CSV.
+    gpu_monitor: GpuMonitor | None = None
+    if args.device == "gpu":
+        gpu_monitor = GpuMonitor.create(device_index=0)
+        if gpu_monitor is None:
+            print("[bench] WARNING: pynvml unavailable; GPU energy/memory "
+                  "columns will be empty.", flush=True)
+        else:
+            idle = gpu_monitor.calibrate_idle(duration_s=0.5)
+            if idle is not None:
+                print(f"[bench] idle baseline: {idle:.2f} W "
+                      f"(energy counter: enabled)")
+            else:
+                print(f"[bench] idle baseline unavailable "
+                      f"(energy counter: disabled)")
+
     rows: list[BenchResult] = []
     t0 = time.perf_counter()
     try:
@@ -104,6 +124,7 @@ def main(argv: list[str] | None = None) -> int:
                         ctx, shape,
                         n_trials=args.n_trials, warmup=args.warmup,
                         verify=args.verify, device=args.device,
+                        gpu_monitor=gpu_monitor,
                     )
                 except Exception as e:
                     print(f"[bench]   FAILED: {type(e).__name__}: {e}", flush=True)
@@ -115,10 +136,20 @@ def main(argv: list[str] | None = None) -> int:
                     f"hbm={r.peak_hbm_mb:.1f}MB  "
                     if r.peak_hbm_mb is not None else ""
                 )
+                energy_str = (
+                    f"E_kern={r.kernel_energy_j:.3f}J  "
+                    f"E_gross={r.gross_energy_j:.3f}J  "
+                    f"P={r.mean_power_w:.1f}W  "
+                    if r.kernel_energy_j is not None else ""
+                )
+                tenancy_str = (
+                    "[CONTENDED] " if r.single_tenant is False else ""
+                )
                 print(
-                    f"[bench]   {r.mean_seconds*1000:.1f}ms ± "
+                    f"[bench]   {tenancy_str}"
+                    f"{r.mean_seconds*1000:.1f}ms ± "
                     f"{r.std_seconds*1000:.1f}ms  "
-                    f"{err_str}{hbm_str}"
+                    f"{err_str}{hbm_str}{energy_str}"
                     f"rot={r.rotations} ct.ct={r.ct_ct_muls} ct.pt={r.ct_pt_muls}",
                     flush=True,
                 )

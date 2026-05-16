@@ -28,6 +28,7 @@ from benchmarks.matmul_encodings.plaintext.thor_plain import (
 )
 
 from ._common import BenchResult, bench_kernel
+from .gpu_sampler import GpuMonitor
 from .shapes import Bmm1Shape, Bmm3Shape, MoaiShape, RowEncShape, ThorShape
 
 
@@ -41,7 +42,7 @@ _BACKEND = lambda ctx: type(ctx.backend).__name__.replace("Library", "").lower()
 
 def bench_bmm1(
     ctx: Context, shape: Bmm1Shape, *, n_trials: int, warmup: int,
-    verify: bool, device: str,
+    verify: bool, device: str, gpu_monitor: GpuMonitor | None = None,
 ) -> BenchResult:
     """Single-block BMM-I bench. Negar's Go runner runs N/s_n * M/s_m * P/s_p
     block matmuls per shape -- to stay close to that, we time ONE block call
@@ -67,6 +68,7 @@ def bench_bmm1(
         shape=shape.label, n_he=ctx.slots, ctx=ctx, run_fn=run,
         n_trials=n_trials, warmup=warmup,
         verify_fn=verify_fn if verify else None,
+        gpu_monitor=gpu_monitor,
     )
 
 
@@ -77,7 +79,7 @@ def bench_bmm1(
 
 def bench_bmm3(
     ctx: Context, shape: Bmm3Shape, *, n_trials: int, warmup: int,
-    verify: bool, device: str,
+    verify: bool, device: str, gpu_monitor: GpuMonitor | None = None,
 ) -> BenchResult:
     rng = np.random.default_rng(seed=42)
     n, m, p = shape.n, shape.m, shape.p
@@ -104,6 +106,7 @@ def bench_bmm3(
         shape=shape.label, n_he=n_he, ctx=ctx, run_fn=run,
         n_trials=n_trials, warmup=warmup,
         verify_fn=verify_fn if verify else None,
+        gpu_monitor=gpu_monitor,
     )
 
 
@@ -114,7 +117,7 @@ def bench_bmm3(
 
 def bench_thor(
     ctx: Context, shape: ThorShape, *, n_trials: int, warmup: int,
-    verify: bool, device: str,
+    verify: bool, device: str, gpu_monitor: GpuMonitor | None = None,
 ) -> BenchResult:
     rng = np.random.default_rng(seed=42)
     H, m, n, c = shape.H, shape.m, shape.n, shape.c
@@ -148,6 +151,7 @@ def bench_thor(
         shape=shape.label, n_he=ctx.slots, ctx=ctx, run_fn=run,
         n_trials=n_trials, warmup=warmup,
         verify_fn=verify_fn if verify else None,
+        gpu_monitor=gpu_monitor,
     )
 
 
@@ -158,7 +162,7 @@ def bench_thor(
 
 def bench_moai_alg3(
     ctx: Context, shape: MoaiShape, *, n_trials: int, warmup: int,
-    verify: bool, device: str,
+    verify: bool, device: str, gpu_monitor: GpuMonitor | None = None,
 ) -> BenchResult:
     rng = np.random.default_rng(seed=42)
     n_batch, m, d_prime = shape.n_batch, shape.m, shape.d_prime
@@ -196,12 +200,13 @@ def bench_moai_alg3(
         shape=shape.label, n_he=n_he, ctx=ctx, run_fn=run,
         n_trials=n_trials, warmup=warmup,
         verify_fn=verify_fn if verify else None,
+        gpu_monitor=gpu_monitor,
     )
 
 
 def bench_moai_alg4(
     ctx: Context, shape: MoaiShape, *, n_trials: int, warmup: int,
-    verify: bool, device: str,
+    verify: bool, device: str, gpu_monitor: GpuMonitor | None = None,
 ) -> BenchResult:
     rng = np.random.default_rng(seed=42)
     n_batch, m, d_prime = shape.n_batch, shape.m, shape.d_prime
@@ -239,6 +244,7 @@ def bench_moai_alg4(
         shape=shape.label, n_he=n_he, ctx=ctx, run_fn=run,
         n_trials=n_trials, warmup=warmup,
         verify_fn=verify_fn if verify else None,
+        gpu_monitor=gpu_monitor,
     )
 
 
@@ -249,7 +255,7 @@ def bench_moai_alg4(
 
 def bench_rowenc(
     ctx: Context, shape: RowEncShape, *, n_trials: int, warmup: int,
-    verify: bool, device: str,
+    verify: bool, device: str, gpu_monitor: GpuMonitor | None = None,
 ) -> BenchResult:
     rng = np.random.default_rng(seed=42)
     n = shape.n
@@ -277,6 +283,7 @@ def bench_rowenc(
         shape=shape.label, n_he=ctx.slots, ctx=ctx, run_fn=run,
         n_trials=n_trials, warmup=warmup,
         verify_fn=verify_fn if verify else None,
+        gpu_monitor=gpu_monitor,
     )
 
 
