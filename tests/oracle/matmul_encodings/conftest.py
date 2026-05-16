@@ -19,9 +19,12 @@ from benchmarks.matmul_encodings.context import Context
 def _make_config(backend: str) -> dict:
     """Minimal CKKS config sized for the matmul-encoding kernels.
 
-    LogN=13 -> 4096 slots (ConjugateInvariant). Five-level chain
-    matches Negar's Lattigo runner default and gives 4 usable mult
-    levels -- enough for a single CMult + Rescale per kernel call.
+    LogN=13 ConjugateInvariant -> 8192 slots on both backends. Five-level
+    chain gives 4 usable mult levels -- enough for a single CMult +
+    Rescale per kernel call. Distinct from Negar's Go DefaultParams
+    (Standard ring, 4096 slots); the benchmark harness exposes a
+    ``--ckks-preset negar`` flag for that comparison instead of changing
+    the test-suite default.
     """
     orion_cfg = {
         "backend": backend,

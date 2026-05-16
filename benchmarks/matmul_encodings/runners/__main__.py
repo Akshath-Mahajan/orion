@@ -34,7 +34,7 @@ import sys
 import time
 from pathlib import Path
 
-from ._common import BenchResult, make_context, write_csv
+from ._common import CKKS_PRESETS, BenchResult, make_context, write_csv
 from .kernels import KERNEL_TABLE
 from .shapes import SHAPE_SETS
 
@@ -45,6 +45,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="CKKS backend.")
     p.add_argument("--device", choices=["cpu", "gpu"], default="cpu",
                    help="desilo device. 'gpu' triggers nvidia-smi HBM sampling.")
+    p.add_argument("--ckks-preset", choices=list(CKKS_PRESETS.keys()),
+                   default="default",
+                   help="CKKS parameter preset. 'default' = LogN=13 "
+                        "ConjugateInvariant (8192 slots, historical). "
+                        "'negar' = LogN=13 Standard + LogQ=55+4*45 + LogP=61 "
+                        "(4096 slots, matches D8 CPU baseline).")
     p.add_argument("--preset", choices=list(SHAPE_SETS.keys()), default="smoke",
                    help="Shape table preset. 'smoke' = one tiny shape per kernel.")
     p.add_argument("--kernels", default=",".join(KERNEL_TABLE.keys()),
@@ -78,11 +84,12 @@ def main(argv: list[str] | None = None) -> int:
     shape_set = SHAPE_SETS[args.preset]
 
     print(f"[bench] backend={args.backend} device={args.device} "
-          f"preset={args.preset} kernels={kernels} "
+          f"ckks_preset={args.ckks_preset} preset={args.preset} "
+          f"kernels={kernels} "
           f"n_trials={args.n_trials} warmup={args.warmup} "
           f"verify={args.verify}")
 
-    ctx = make_context(args.backend, device=args.device)
+    ctx = make_context(args.backend, device=args.device, preset=args.ckks_preset)
     print(f"[bench] context: slots={ctx.slots} max_level={ctx.max_level}")
 
     rows: list[BenchResult] = []

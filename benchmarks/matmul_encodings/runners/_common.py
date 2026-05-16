@@ -155,29 +155,59 @@ def write_csv(results: Iterable[BenchResult], path: Path | str) -> None:
             w.writerow(r.csv_row())
 
 
-def make_context(backend: str, device: str = "cpu") -> Context:
-    """Build a fresh Context at the test-suite CKKS config: LogN=13,
-    ConjugateInvariant ring, slot_count = 4096, 5 levels with 29/26/26/26/26
-    primes. Same params as ``tests/oracle/matmul_encodings/conftest.py``.
+# CKKS parameter presets. Each preset is a fully-specified ``ckks_params``
+# dict. The orion/backend/device slice is filled in by ``make_context``.
+#
+# - ``default``: the test-suite config used by everything prior to this
+#   commit -- LogN=13 ConjugateInvariant, 5 levels at 29/26-bit primes.
+#   Lands at 8192 slots on both backends.
+# - ``negar``: a 1:1 port of Negar's Go DefaultParams in
+#   matmul-encoding-material/MatMult/matmult/init_lattigo.go --
+#   LogN=13 Standard, LogQ=55+4*45, LogP=61. Lands at true 4096 slots on
+#   both backends thanks to the desilo binding fix that wires ``slot_count``
+#   through to the ``Engine(slot_count=..., max_level=...)`` overload.
+CKKS_PRESETS: dict[str, dict[str, object]] = {
+    "default": {
+        "LogN": 13,
+        "LogQ": [29, 26, 26, 26, 26],
+        "LogP": [29],
+        "LogScale": 26,
+        "H": 8192,
+        "RingType": "ConjugateInvariant",
+    },
+    "negar": {
+        "LogN": 13,
+        "LogQ": [55, 45, 45, 45, 45],
+        "LogP": [61],
+        "LogScale": 45,
+        "H": 8192,
+        "RingType": "Standard",
+    },
+}
 
-    This is NOT identical to Negar's Go DefaultParams (LogN=13 Standard,
-    LogQ=55+4*45). The mismatch is intentional: desilo's Standard ring at
-    LogN=13 reports 8192 slots while lattigo reports 4096 -- a backend
-    semantic split that breaks shape arithmetic on the desilo side. The
-    ConjugateInvariant path lands at 4096 slots on both backends, matching
-    Negar's effective slot count even though the underlying ring differs.
 
-    `device` only matters for the desilo backend; lattigo ignores it.
+def make_context(
+    backend: str,
+    device: str = "cpu",
+    *,
+    preset: str = "default",
+) -> Context:
+    """Build a fresh Context at the requested CKKS preset.
+
+    ``preset="default"`` keeps the historical test-suite config (LogN=13
+    ConjugateInvariant, 8192 slots). ``preset="negar"`` matches the Go
+    DefaultParams used by the D8 CPU baseline (LogN=13 Standard,
+    LogQ=55+4*45, LogP=61, 4096 slots on both backends).
+
+    ``device`` only matters for the desilo backend; lattigo ignores it.
     """
+    if preset not in CKKS_PRESETS:
+        raise ValueError(
+            f"Unknown CKKS preset {preset!r}. "
+            f"Available: {sorted(CKKS_PRESETS)}"
+        )
     config = {
-        "ckks_params": {
-            "LogN": 13,
-            "LogQ": [29, 26, 26, 26, 26],
-            "LogP": [29],
-            "LogScale": 26,
-            "H": 8192,
-            "RingType": "ConjugateInvariant",
-        },
+        "ckks_params": dict(CKKS_PRESETS[preset]),
         "orion": {
             "backend": backend,
             "io_mode": "none",

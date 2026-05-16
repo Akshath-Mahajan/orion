@@ -177,51 +177,82 @@ def thor_cc_matmul_he(
         [1.0] * ctx.slots, mul_level - 1, ctx.scheme.params.get_default_scale()
     )
 
-    # Lines 4-8 of Algorithm 2: build all p_cjl[j][ell] products.
-    # Lazy: mul_nr leaves each product as a degree-2 ciphertext.
-    p_cjl: list[list[int | None]] = [[None] * n for _ in range(mc)]
-    for j in range(mc):
-        # ell=0 product (no rotation)
-        prod = ctx.mul_nr(p_as_cts[j], p_b_rep_cts[0])
-        prod = ctx.rescale(prod)
-        p_cjl[j][0] = prod
+    # Lines 4-17 of Algorithm 2, fused: for each input row j, build
+    # p_j[0..n-1], fold p_j[1..n-1] into the global accumulators, then
+    # free p_j[1..n-1]. Only p_j[0] survives across outer-j (it's reused
+    # in the final assembly). The original Negar formulation builds the
+    # full mc*n p_cjl array up front; on GPU that OOMs around d=256 even
+    # with eager free of rescale temporaries. Fusing drops peak working
+    # set from O(mc*n) to O(mc + n) -- the mc per-row col-0 ciphertexts
+    # plus one current row's n ciphertexts -- which lets the kernel
+    # scale to d=2048 within the 24 GiB on an RTX 3090.
+    #
+    # GPU memory note: ctx.rescale on desilo is a clone (RescaleNew
+    # calls engine.clone), so we also free pre-rescale temporaries.
+    acc_prime: list[int | None] = [None] * mc
+    acc_d_prime: list[int | None] = [None] * mc
+    p_col0: list[int | None] = [None] * mc  # p_cjl[j][0] for each input j
 
-        # ell in [1, n): hoisted batched rotation of p_as[j], then mul.
-        shifts = [((-n) * (ell % c) + ell) * H for ell in range(1, n)]
+    def _accumulate(acc_list, idx, v):
+        """acc_list[idx] = (acc_list[idx] + v) or v; free the old acc and v
+        if both were present. Returns nothing."""
+        if acc_list[idx] is None:
+            acc_list[idx] = v
+        else:
+            new_acc = ctx.add(acc_list[idx], v)
+            ctx.free(acc_list[idx], v)
+            acc_list[idx] = new_acc
+
+    shifts = [((-n) * (ell % c) + ell) * H for ell in range(1, n)]
+
+    for j in range(mc):
+        # Build p_j[0]
+        prod = ctx.mul_nr(p_as_cts[j], p_b_rep_cts[0])
+        rescaled = ctx.rescale(prod)
+        ctx.free(prod)
+        p_col0[j] = rescaled
+
+        # Build p_j[1..n-1] via hoisted batched rotation, then immediately
+        # fold each into the accumulators and free.
         rotated = ctx.rot_batch(p_as_cts[j], shifts)
         for ell, rot_ct in zip(range(1, n), rotated):
             prod = ctx.mul_nr(rot_ct, p_b_rep_cts[ell])
-            prod = ctx.rescale(prod)
-            p_cjl[j][ell] = prod
+            ctx.free(rot_ct)
+            v = ctx.rescale(prod)
+            ctx.free(prod)
 
-    # Lines 9-17: masking + accumulation into acc_prime / acc_d_prime.
-    # All accumulators stay at degree-2 (mul_pt and add preserve degree).
-    acc_prime: list[int | None] = [None] * mc
-    acc_d_prime: list[int | None] = [None] * mc
-
-    for ell in range(1, n):
-        mu0_pt, mu1_pt, mu2_pt, mu3_pt = encoded_masks[ell - 1]
-        ell_q = ell // c
-        for j in range(mc):
-            v = p_cjl[j][ell]
+            # Fold v into accumulators (same logic as the original Phase 2
+            # inner body, just running per-(j, ell) inline).
+            mu0_pt, mu1_pt, mu2_pt, mu3_pt = encoded_masks[ell - 1]
+            ell_q = ell // c
             j_same = (j + ell_q) % mc
             j_next = (j + ell_q + 1) % mc
 
-            v1 = ctx.rescale(ctx.mul_pt(v, mu1_pt))
-            acc_prime[j_same] = v1 if acc_prime[j_same] is None else ctx.add(acc_prime[j_same], v1)
+            v1_pre = ctx.mul_pt(v, mu1_pt)
+            v1 = ctx.rescale(v1_pre)
+            ctx.free(v1_pre)
+            _accumulate(acc_prime, j_same, v1)
 
             if mu0_pt is not None:
-                v0 = ctx.rescale(ctx.mul_pt(v, mu0_pt))
-                acc_prime[j_next] = v0 if acc_prime[j_next] is None else ctx.add(acc_prime[j_next], v0)
+                v0_pre = ctx.mul_pt(v, mu0_pt)
+                v0 = ctx.rescale(v0_pre)
+                ctx.free(v0_pre)
+                _accumulate(acc_prime, j_next, v0)
             if mu2_pt is not None:
-                v2 = ctx.rescale(ctx.mul_pt(v, mu2_pt))
-                acc_d_prime[j_next] = v2 if acc_d_prime[j_next] is None else ctx.add(acc_d_prime[j_next], v2)
+                v2_pre = ctx.mul_pt(v, mu2_pt)
+                v2 = ctx.rescale(v2_pre)
+                ctx.free(v2_pre)
+                _accumulate(acc_d_prime, j_next, v2)
 
             # v3 = v * mu3 (computed directly rather than v - v0 - v1 - v2,
             # which would require a DropLevel that neither binding exposes).
             # Pays one extra ct*pt per ell-iter; semantically identical.
-            v3 = ctx.rescale(ctx.mul_pt(v, mu3_pt))
-            acc_d_prime[j_same] = v3 if acc_d_prime[j_same] is None else ctx.add(acc_d_prime[j_same], v3)
+            v3_pre = ctx.mul_pt(v, mu3_pt)
+            v3 = ctx.rescale(v3_pre)
+            ctx.free(v3_pre)
+            _accumulate(acc_d_prime, j_same, v3)
+
+            ctx.free(v)
 
     # Line 18: final assembly. All accumulators are degree-2 at L-2; the
     # base term is degree-2 at L-1. Drop the base to L-2 by multiplying by
@@ -230,15 +261,29 @@ def thor_cc_matmul_he(
     # separately (the rotation in the next step requires degree-1).
     out: list[int] = []
     for j in range(mc):
-        base = ctx.rescale(ctx.mul_pt(p_cjl[j][0], ones_pt))
+        base_pre = ctx.mul_pt(p_col0[j], ones_pt)
+        base = ctx.rescale(base_pre)
+        ctx.free(base_pre, p_col0[j])
+        p_col0[j] = None
+
         if acc_prime[j] is not None:
-            base = ctx.add(base, acc_prime[j])
-        base = ctx.relin(base)
+            new_base = ctx.add(base, acc_prime[j])
+            ctx.free(base, acc_prime[j])
+            acc_prime[j] = None
+            base = new_base
+        base_relin = ctx.relin(base)
+        ctx.free(base)
+        base = base_relin
 
         if acc_d_prime[j] is not None:
             acc_d = ctx.relin(acc_d_prime[j])
+            ctx.free(acc_d_prime[j])
+            acc_d_prime[j] = None
             rolled = ctx.rot(acc_d, -nH)
-            base = ctx.add(base, rolled)
+            ctx.free(acc_d)
+            new_base = ctx.add(base, rolled)
+            ctx.free(base, rolled)
+            base = new_base
         out.append(base)
     return out
 
