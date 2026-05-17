@@ -52,12 +52,21 @@ from typing import Iterator
 class GpuSample:
     """One row of GPU measurement, produced by ``GpuMonitor.measure()``.
 
+    Two memory columns:
+      * peak_hbm_mb       cumulative process high-water mark during the
+                          timed window. Includes any state left behind
+                          by prior kernels sharing the same ctx.
+      * peak_hbm_delta_mb peak - baseline_at_window_enter. Approximates
+                          the memory this kernel *added* on top of its
+                          starting state. Comparable kernel-to-kernel.
+
     Energy columns are filled when the NVML energy counter is available
     AND single-tenancy held throughout the timed block. ``mean_power_w``
     is gross_energy / window_seconds; useful as a sanity check.
     """
 
     peak_hbm_mb: float | None
+    peak_hbm_delta_mb: float | None
     gross_energy_j: float | None       # raw counter delta / n_trials
     kernel_energy_j: float | None      # gross minus idle*duration / n_trials
     mean_power_w: float | None         # gross_energy / total_window_s
@@ -76,10 +85,24 @@ class GpuMonitor:
         self._h = handle
         self._my_pid = my_pid
         self._energy_supported = energy_supported
-        self._idle_power_w: float | None = None  # set by calibrate_idle()
+        # Resident idle (engine+keys loaded): set by calibrate_idle()
+        # AFTER ctx creation. Used to compute kernel_energy_j.
+        self._idle_power_w: float | None = None
+        # True idle (no FHE state allocated yet): sampled once inside
+        # create() before the caller allocates a Context. Informational
+        # column in every BenchResult; never used for energy subtraction.
+        self._true_idle_w: float | None = None
 
     @classmethod
-    def create(cls, device_index: int = 0) -> "GpuMonitor | None":
+    def create(cls, device_index: int = 0,
+               *, true_idle_duration_s: float = 0.5) -> "GpuMonitor | None":
+        """Build a monitor and capture the true-idle baseline.
+
+        Call this BEFORE ``make_context`` / any other GPU work in the
+        process so the true idle reading reflects "no FHE state
+        allocated". Returns None cleanly if pynvml is missing or no
+        GPU is visible.
+        """
         try:
             import pynvml
         except ImportError:
@@ -96,8 +119,23 @@ class GpuMonitor:
             pynvml.nvmlDeviceGetTotalEnergyConsumption(handle)
         except Exception:
             energy_ok = False
-        return cls(handle=handle, my_pid=os.getpid(),
-                   energy_supported=energy_ok)
+
+        mon = cls(handle=handle, my_pid=os.getpid(),
+                  energy_supported=energy_ok)
+
+        # True-idle baseline: sample BEFORE the caller creates a Context.
+        # Uses the same counter-delta method as calibrate_idle() but
+        # under the (caller-controlled) precondition of no resident
+        # FHE state.
+        if energy_ok:
+            e0 = pynvml.nvmlDeviceGetTotalEnergyConsumption(handle) / 1000.0
+            t0 = time.perf_counter()
+            time.sleep(true_idle_duration_s)
+            e1 = pynvml.nvmlDeviceGetTotalEnergyConsumption(handle) / 1000.0
+            t1 = time.perf_counter()
+            mon._true_idle_w = (e1 - e0) / (t1 - t0)
+
+        return mon
 
     # ------------------------------------------------------------------
     # Low-level NVML reads
@@ -164,7 +202,13 @@ class GpuMonitor:
 
     @property
     def idle_power_w(self) -> float | None:
+        """Resident idle (post-ctx) used for kernel_energy_j subtraction."""
         return self._idle_power_w
+
+    @property
+    def true_idle_w(self) -> float | None:
+        """True idle (pre-ctx) -- informational only."""
+        return self._true_idle_w
 
     # ------------------------------------------------------------------
     # Measurement
@@ -183,7 +227,14 @@ class GpuMonitor:
         final metrics. Other compute processes appearing on the GPU at
         sample time flip ``single_tenant=False``.
         """
-        peak_holder = {"peak": 0.0, "single_tenant": True}
+        # Snapshot baseline memory at window enter so the delta column
+        # reflects "memory this kernel added on top of its starting
+        # state", not cumulative process memory.
+        baseline_mb = self._used_mem_mb_for_pid()
+        peak_holder = {
+            "peak": baseline_mb,
+            "single_tenant": True,
+        }
         stop = threading.Event()
 
         def _sampler() -> None:
@@ -207,6 +258,7 @@ class GpuMonitor:
 
         sample = GpuSample(
             peak_hbm_mb=None,
+            peak_hbm_delta_mb=None,
             gross_energy_j=None,
             kernel_energy_j=None,
             mean_power_w=None,
@@ -225,6 +277,9 @@ class GpuMonitor:
             window = t_after - t_before
             sample.window_seconds = window
             sample.peak_hbm_mb = peak_holder["peak"]
+            sample.peak_hbm_delta_mb = max(
+                0.0, peak_holder["peak"] - baseline_mb
+            )
             sample.single_tenant = peak_holder["single_tenant"]
 
             if e_before is not None and e_after is not None and window > 0:

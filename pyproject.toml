@@ -23,6 +23,14 @@ dependencies = [
     "certifi>=2024.2.2",
 ]
 
+# Optional extras. Install with `pip install orion-fhe[bench-gpu]`.
+# bench-gpu pulls in NVML bindings used by the matmul-encoding D7
+# harness (benchmarks/matmul_encodings/runners/gpu_sampler.py) for
+# peak HBM + per-kernel energy measurement. The package is the
+# official Nvidia-maintained NVML wrapper.
+[project.optional-dependencies]
+bench-gpu = ["nvidia-ml-py>=12.0"]
+
 [tool.pytest.ini_options]
 markers = ["slow: marks tests as slow (bootstrap, large params)"]
 addopts = "-m 'not slow'"

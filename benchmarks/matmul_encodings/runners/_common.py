@@ -50,18 +50,31 @@ class BenchResult:
     rotations: int
     ct_ct_muls: int
     ct_pt_muls: int
-    # GPU measurement columns. peak_hbm_mb is the TRUE peak of our
-    # process's used GPU memory over the timed window (~5ms NVML poll),
-    # NOT the before/after delta the prior implementation reported.
+    # GPU memory columns (true peak via NVML sampling thread):
+    #  - peak_hbm_mb       cumulative process high-water mark during
+    #                      the timed window. Includes residual state
+    #                      from prior kernels in the same run since
+    #                      the harness reuses one Context across all
+    #                      kernels.
+    #  - peak_hbm_delta_mb peak - baseline_at_window_enter. The memory
+    #                      THIS kernel added on top of its starting
+    #                      state. Comparable kernel-to-kernel.
     peak_hbm_mb: float | None
+    peak_hbm_delta_mb: float | None
     # Per-trial GPU energy (joules). gross is the raw counter delta /
-    # n_trials; kernel_energy_j subtracts (idle_power_w * mean_seconds)
-    # so it approximates the kernel's marginal energy cost above idle.
+    # n_trials; kernel_energy_j subtracts (resident_idle_w * window)
+    # so it approximates the kernel's marginal energy above the
+    # engine+keys-resident idle floor.
     gross_energy_j: float | None
     kernel_energy_j: float | None
     # mean_power_w = gross_energy_total / window_seconds. Useful sanity
     # check (should land between idle and TDP).
     mean_power_w: float | None
+    # True idle power, sampled once before any FHE state is allocated.
+    # Same value on every row from a single run; included so the CSV
+    # is self-describing (paper figure can compare true vs resident
+    # idle without an external reference).
+    true_idle_w: float | None
     # False if any compute PID other than ours was on the GPU during
     # the timed window. When False, the energy columns above are
     # overcounted (whole-GPU counter, not per-process attributable).
@@ -146,14 +159,21 @@ def bench_kernel(
             print(f"  [warn] verify_fn raised on {kernel}/{shape}: {e}")
 
     if gpu_sample is None:
-        peak_hbm = gross_e = kern_e = mean_p = None
+        peak_hbm = peak_hbm_delta = gross_e = kern_e = mean_p = None
         single_tenant = None
     else:
         peak_hbm = gpu_sample.peak_hbm_mb
+        peak_hbm_delta = gpu_sample.peak_hbm_delta_mb
         gross_e = gpu_sample.gross_energy_j
         kern_e = gpu_sample.kernel_energy_j
         mean_p = gpu_sample.mean_power_w
         single_tenant = gpu_sample.single_tenant
+
+    # true_idle_w is identical across every row from a single run; it
+    # lives on the GpuMonitor (sampled once before any ctx existed).
+    true_idle = (
+        gpu_monitor.true_idle_w if gpu_monitor is not None else None
+    )
 
     return BenchResult(
         backend=backend,
@@ -170,9 +190,11 @@ def bench_kernel(
         ct_ct_muls=counts.ct_ct_muls // n_trials,
         ct_pt_muls=counts.ct_pt_muls // n_trials,
         peak_hbm_mb=peak_hbm,
+        peak_hbm_delta_mb=peak_hbm_delta,
         gross_energy_j=gross_e,
         kernel_energy_j=kern_e,
         mean_power_w=mean_p,
+        true_idle_w=true_idle,
         single_tenant=single_tenant,
         max_abs_err=max_err,
     )

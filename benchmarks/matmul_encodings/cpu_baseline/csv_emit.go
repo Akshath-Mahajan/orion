@@ -13,8 +13,9 @@
 //
 // Schema: backend, device, kernel, shape, n_he, n_trials,
 //         mean_seconds, std_seconds, rotations, ct_ct_muls, ct_pt_muls,
-//         peak_hbm_mb, gross_energy_j, kernel_energy_j, mean_power_w,
-//         single_tenant, max_abs_err
+//         peak_hbm_mb, peak_hbm_delta_mb, gross_energy_j,
+//         kernel_energy_j, mean_power_w, true_idle_w, single_tenant,
+//         max_abs_err
 //
 // GPU-only columns (peak_hbm_mb through single_tenant) are written
 // empty for CPU rows -- pandas reads them as NaN, which is what the
@@ -32,7 +33,7 @@ import (
 var (
 	csvFile   *os.File
 	csvOnce   sync.Once
-	csvHeader = "backend,device,kernel,shape,n_he,n_trials,mean_seconds,std_seconds,rotations,ct_ct_muls,ct_pt_muls,peak_hbm_mb,gross_energy_j,kernel_energy_j,mean_power_w,single_tenant,max_abs_err"
+	csvHeader = "backend,device,kernel,shape,n_he,n_trials,mean_seconds,std_seconds,rotations,ct_ct_muls,ct_pt_muls,peak_hbm_mb,peak_hbm_delta_mb,gross_energy_j,kernel_energy_j,mean_power_w,true_idle_w,single_tenant,max_abs_err"
 )
 
 func csvOpen() {
@@ -75,9 +76,10 @@ func csvEmit(
 		errStr = fmt.Sprintf("%.6e", maxErr)
 	}
 	// GPU-only columns are empty on CPU rows: peak_hbm_mb,
-	// gross_energy_j, kernel_energy_j, mean_power_w, single_tenant.
+	// peak_hbm_delta_mb, gross_energy_j, kernel_energy_j,
+	// mean_power_w, true_idle_w, single_tenant (7 commas).
 	fmt.Fprintf(csvFile,
-		"lattigo,cpu,%s,%q,%d,%d,%.6f,%.6f,%d,%d,%d,,,,,,%s\n",
+		"lattigo,cpu,%s,%q,%d,%d,%.6f,%.6f,%d,%d,%d,,,,,,,,%s\n",
 		kernel, shape, nHE, nTrials,
 		mean.Seconds(), std.Seconds(),
 		rot, ctCt, ctPt,
