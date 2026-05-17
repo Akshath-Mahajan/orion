@@ -64,8 +64,60 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Skip max_abs_err computation (saves a decrypt per shape).")
     p.add_argument("--output", required=True, type=Path,
                    help="Output CSV path. Parent dirs are created if needed.")
+    p.add_argument("--lock-gpu-clocks", type=int, default=None, metavar="MHZ",
+                   help="If set, run `nvidia-smi --lock-gpu-clocks=MHZ,MHZ` "
+                        "at start and `--reset-gpu-clocks` on exit. Needs "
+                        "sudo or appropriate permissions; failure is "
+                        "logged but does not abort the run. Recommended "
+                        "for paper sweeps to remove boost-clock variance.")
+    p.add_argument("--cold-start", action="store_true",
+                   help="Pause between shapes until GPU temperature is "
+                        "within --cold-start-tolerance-c of the baseline "
+                        "captured at start. Removes thermal drift across "
+                        "the sweep at the cost of wall-clock time.")
+    p.add_argument("--cold-start-tolerance-c", type=float, default=2.0,
+                   help="Tolerance in Celsius for --cold-start pacing.")
+    p.add_argument("--cold-start-timeout-s", type=float, default=60.0,
+                   help="Max seconds --cold-start will wait per shape "
+                        "before giving up and proceeding (the row's "
+                        "start_temp_c column flags the actual temp).")
     p.set_defaults(verify=True)
     return p.parse_args(argv)
+
+
+def _set_gpu_clocks(mhz: int | None) -> bool:
+    """Lock the GPU graphics clock via nvidia-smi. Returns True on
+    success, False on failure (logged). Caller is responsible for
+    calling _reset_gpu_clocks() on exit even if this returned False
+    (no-op in that case)."""
+    if mhz is None:
+        return True
+    import subprocess
+    cmd = ["nvidia-smi", "--lock-gpu-clocks=" + f"{mhz},{mhz}", "-i", "0"]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True,
+                       timeout=10)
+        print(f"[bench] locked GPU clock to {mhz} MHz")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"[bench] WARNING: clock lock failed "
+              f"(stderr: {e.stderr.strip()}). Continuing unpinned.",
+              flush=True)
+        return False
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        print(f"[bench] WARNING: clock lock unavailable: {e}. "
+              f"Continuing unpinned.", flush=True)
+        return False
+
+
+def _reset_gpu_clocks() -> None:
+    import subprocess
+    try:
+        subprocess.run(["nvidia-smi", "--reset-gpu-clocks", "-i", "0"],
+                       check=False, capture_output=True, text=True,
+                       timeout=10)
+    except Exception:
+        pass
 
 
 def _selected_kernels(spec: str) -> list[str]:
@@ -88,7 +140,16 @@ def main(argv: list[str] | None = None) -> int:
           f"ckks_preset={args.ckks_preset} preset={args.preset} "
           f"kernels={kernels} "
           f"n_trials={args.n_trials} warmup={args.warmup} "
-          f"verify={args.verify}")
+          f"verify={args.verify} "
+          f"lock_clock={args.lock_gpu_clocks} "
+          f"cold_start={args.cold_start}")
+
+    # Optional clock pinning. Done BEFORE GpuMonitor.create() so the
+    # true-idle baseline reflects the pinned clock too.
+    clock_pin_attempted = (args.lock_gpu_clocks is not None
+                           and args.device == "gpu")
+    if clock_pin_attempted:
+        _set_gpu_clocks(args.lock_gpu_clocks)
 
     # GPU monitor setup. MUST run before make_context() so the
     # true-idle baseline reflects "no FHE state allocated yet". The
@@ -100,12 +161,15 @@ def main(argv: list[str] | None = None) -> int:
         if gpu_monitor is None:
             print("[bench] WARNING: pynvml unavailable; GPU energy/memory "
                   "columns will be empty.", flush=True)
-        elif gpu_monitor.true_idle_w is not None:
-            print(f"[bench] true idle (pre-ctx): "
-                  f"{gpu_monitor.true_idle_w:.2f} W")
         else:
-            print(f"[bench] true idle unavailable "
-                  f"(energy counter: disabled)")
+            if gpu_monitor.true_idle_w is not None:
+                print(f"[bench] true idle (pre-ctx): "
+                      f"{gpu_monitor.true_idle_w:.2f} W")
+            if gpu_monitor.baseline_temp_c is not None:
+                print(f"[bench] baseline GPU temp: "
+                      f"{gpu_monitor.baseline_temp_c:.1f} C "
+                      f"(cold-start target = baseline + "
+                      f"{args.cold_start_tolerance_c:.1f} C)")
 
     ctx = make_context(args.backend, device=args.device, preset=args.ckks_preset)
     print(f"[bench] context: slots={ctx.slots} max_level={ctx.max_level}")
@@ -118,6 +182,12 @@ def main(argv: list[str] | None = None) -> int:
         if idle is not None:
             print(f"[bench] resident idle (post-ctx): {idle:.2f} W "
                   f"(used for kernel_energy_j subtraction)")
+        # Hand the cold-start config off to the monitor; bench_kernel
+        # applies it post-warmup so the timed window starts from a
+        # consistent thermal state on every shape.
+        if args.cold_start:
+            gpu_monitor.cold_start_tolerance_c = args.cold_start_tolerance_c
+            gpu_monitor.cold_start_timeout_s = args.cold_start_timeout_s
 
     rows: list[BenchResult] = []
     t0 = time.perf_counter()
@@ -150,6 +220,12 @@ def main(argv: list[str] | None = None) -> int:
                     f"P={r.mean_power_w:.1f}W  "
                     if r.kernel_energy_j is not None else ""
                 )
+                env_str = (
+                    f"T={r.start_temp_c:.1f}C  "
+                    f"clk={r.mean_clock_mhz:.0f}MHz  "
+                    if r.start_temp_c is not None
+                    and r.mean_clock_mhz is not None else ""
+                )
                 tenancy_str = (
                     "[CONTENDED] " if r.single_tenant is False else ""
                 )
@@ -157,13 +233,16 @@ def main(argv: list[str] | None = None) -> int:
                     f"[bench]   {tenancy_str}"
                     f"{r.mean_seconds*1000:.1f}ms ± "
                     f"{r.std_seconds*1000:.1f}ms  "
-                    f"{err_str}{hbm_str}{energy_str}"
+                    f"{err_str}{hbm_str}{energy_str}{env_str}"
                     f"rot={r.rotations} ct.ct={r.ct_ct_muls} ct.pt={r.ct_pt_muls}",
                     flush=True,
                 )
                 rows.append(r)
     finally:
         ctx.scheme.delete_scheme()
+        if clock_pin_attempted:
+            _reset_gpu_clocks()
+            print("[bench] reset GPU clocks")
 
     write_csv(rows, args.output)
     elapsed = time.perf_counter() - t0

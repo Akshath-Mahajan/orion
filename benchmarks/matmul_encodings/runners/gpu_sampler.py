@@ -63,6 +63,13 @@ class GpuSample:
     Energy columns are filled when the NVML energy counter is available
     AND single-tenancy held throughout the timed block. ``mean_power_w``
     is gross_energy / window_seconds; useful as a sanity check.
+
+    Methodology-verification columns (always populated on GPU runs):
+      * start_temp_c       GPU temp at the moment timing begins. Lets
+                           post-hoc analysis confirm cold-start worked.
+      * mean_clock_mhz     average graphics clock during the window.
+                           Verifies clock pinning held, or characterises
+                           boost behaviour if unpinned.
     """
 
     peak_hbm_mb: float | None
@@ -70,6 +77,8 @@ class GpuSample:
     gross_energy_j: float | None       # raw counter delta / n_trials
     kernel_energy_j: float | None      # gross minus idle*duration / n_trials
     mean_power_w: float | None         # gross_energy / total_window_s
+    start_temp_c: float | None
+    mean_clock_mhz: float | None
     window_seconds: float
     single_tenant: bool                # False if other PIDs were seen
 
@@ -92,6 +101,18 @@ class GpuMonitor:
         # create() before the caller allocates a Context. Informational
         # column in every BenchResult; never used for energy subtraction.
         self._true_idle_w: float | None = None
+        # GPU temperature at the moment ``create()`` was called -- the
+        # reference cold temperature that ``wait_for_cold()`` will pace
+        # subsequent rows back to. Set in create().
+        self._baseline_temp_c: float | None = None
+        # Optional cold-start config. When set (typically by the CLI's
+        # --cold-start flag), ``bench_kernel`` calls ``wait_for_cold``
+        # BETWEEN warmup and the timed loop so the timed window always
+        # starts from the same thermal state. Stored on the monitor so
+        # we don't have to thread the config through every per-kernel
+        # bench function's signature.
+        self.cold_start_tolerance_c: float | None = None
+        self.cold_start_timeout_s: float = 60.0
 
     @classmethod
     def create(cls, device_index: int = 0,
@@ -122,6 +143,14 @@ class GpuMonitor:
 
         mon = cls(handle=handle, my_pid=os.getpid(),
                   energy_supported=energy_ok)
+
+        # Capture baseline temperature now -- this is "cold" by
+        # definition (caller hasn't allocated GPU state yet).
+        try:
+            mon._baseline_temp_c = float(pynvml.nvmlDeviceGetTemperature(
+                handle, pynvml.NVML_TEMPERATURE_GPU))
+        except Exception:
+            mon._baseline_temp_c = None
 
         # True-idle baseline: sample BEFORE the caller creates a Context.
         # Uses the same counter-delta method as calibrate_idle() but
@@ -177,6 +206,58 @@ class GpuMonitor:
             return []
         return [p.pid for p in procs if p.pid != self._my_pid]
 
+    def _temperature_c(self) -> float | None:
+        """Current GPU core temperature in Celsius, or None if NVML
+        rejects the query."""
+        import pynvml
+        try:
+            return float(pynvml.nvmlDeviceGetTemperature(
+                self._h, pynvml.NVML_TEMPERATURE_GPU))
+        except Exception:
+            return None
+
+    def _clock_mhz(self) -> int | None:
+        """Current graphics clock in MHz, or None if NVML rejects."""
+        import pynvml
+        try:
+            return int(pynvml.nvmlDeviceGetClockInfo(
+                self._h, pynvml.NVML_CLOCK_GRAPHICS))
+        except Exception:
+            return None
+
+    @property
+    def baseline_temp_c(self) -> float | None:
+        """Reference cold temperature, captured at ``create()`` time."""
+        return self._baseline_temp_c
+
+    def wait_for_cold(self, *, tolerance_c: float = 2.0,
+                      timeout_s: float = 60.0,
+                      poll_s: float = 1.0) -> tuple[float | None, float]:
+        """Block until GPU temp falls within ``tolerance_c`` of the
+        baseline captured at ``create()`` time (or timeout).
+
+        Returns (final_temp, wait_seconds). final_temp is None if NVML
+        can't read temperature on this device. Logs nothing -- caller
+        prints if needed.
+
+        If ``baseline_temp_c`` is unavailable, returns immediately with
+        whatever temp we can read (no pacing).
+        """
+        if self._baseline_temp_c is None:
+            return self._temperature_c(), 0.0
+        target = self._baseline_temp_c + tolerance_c
+        start = time.perf_counter()
+        while True:
+            cur = self._temperature_c()
+            elapsed = time.perf_counter() - start
+            if cur is None:
+                return None, elapsed
+            if cur <= target:
+                return cur, elapsed
+            if elapsed >= timeout_s:
+                return cur, elapsed
+            time.sleep(poll_s)
+
     # ------------------------------------------------------------------
     # Calibration
     # ------------------------------------------------------------------
@@ -231,9 +312,12 @@ class GpuMonitor:
         # reflects "memory this kernel added on top of its starting
         # state", not cumulative process memory.
         baseline_mb = self._used_mem_mb_for_pid()
+        start_temp = self._temperature_c()
         peak_holder = {
             "peak": baseline_mb,
             "single_tenant": True,
+            "clock_sum": 0.0,
+            "clock_count": 0,
         }
         stop = threading.Event()
 
@@ -244,6 +328,10 @@ class GpuMonitor:
                     peak_holder["peak"] = used
                 if self._other_compute_pids():
                     peak_holder["single_tenant"] = False
+                clk = self._clock_mhz()
+                if clk is not None:
+                    peak_holder["clock_sum"] += clk
+                    peak_holder["clock_count"] += 1
                 time.sleep(poll_ms / 1000.0)
 
         # Initial single-tenancy check before starting the thread.
@@ -262,6 +350,8 @@ class GpuMonitor:
             gross_energy_j=None,
             kernel_energy_j=None,
             mean_power_w=None,
+            start_temp_c=start_temp,
+            mean_clock_mhz=None,
             window_seconds=0.0,
             single_tenant=True,
         )
@@ -281,6 +371,10 @@ class GpuMonitor:
                 0.0, peak_holder["peak"] - baseline_mb
             )
             sample.single_tenant = peak_holder["single_tenant"]
+            if peak_holder["clock_count"] > 0:
+                sample.mean_clock_mhz = (
+                    peak_holder["clock_sum"] / peak_holder["clock_count"]
+                )
 
             if e_before is not None and e_after is not None and window > 0:
                 gross = e_after - e_before

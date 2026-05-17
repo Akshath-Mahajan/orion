@@ -75,6 +75,12 @@ class BenchResult:
     # is self-describing (paper figure can compare true vs resident
     # idle without an external reference).
     true_idle_w: float | None
+    # Methodology-verification columns: GPU temp at the START of the
+    # timed window (so a paper figure can confirm cold-start pacing
+    # held) and the mean graphics clock during the window (verifies
+    # clock pinning held, or characterises boost if unpinned).
+    start_temp_c: float | None
+    mean_clock_mhz: float | None
     # False if any compute PID other than ours was on the GPU during
     # the timed window. When False, the energy columns above are
     # overcounted (whole-GPU counter, not per-process attributable).
@@ -129,6 +135,23 @@ def bench_kernel(
     for _ in range(warmup):
         run_fn()
 
+    # Optional cold-start pacing. Runs HERE -- after warmup, before
+    # timing -- so the timed window always starts from a consistent
+    # thermal state. Configured on the GpuMonitor by the CLI's
+    # --cold-start flag. Skipped if no monitor / no config.
+    if (gpu_monitor is not None
+            and gpu_monitor.cold_start_tolerance_c is not None):
+        cur_temp, wait_s = gpu_monitor.wait_for_cold(
+            tolerance_c=gpu_monitor.cold_start_tolerance_c,
+            timeout_s=gpu_monitor.cold_start_timeout_s,
+        )
+        if wait_s >= gpu_monitor.cold_start_timeout_s:
+            print(f"  [cold-start] TIMEOUT after {wait_s:.1f}s "
+                  f"at {cur_temp:.1f}C", flush=True)
+        elif wait_s > 0.5:
+            print(f"  [cold-start] post-warmup wait {wait_s:.1f}s "
+                  f"-> {cur_temp:.1f}C", flush=True)
+
     ctx.reset_counts()
 
     times: list[float] = []
@@ -143,10 +166,27 @@ def bench_kernel(
         from contextlib import nullcontext
         sampler_cm = nullcontext(None)
 
+    # torch.cuda.synchronize() blocks until pending CUDA work issued by
+    # the desilo Engine has finished, so the per-trial timer captures
+    # the kernel's actual wall-clock instead of leaking into the next
+    # trial. Empirically (smoke test on the 3090): mean barely changes
+    # (~0.8%) but trial-to-trial CV roughly halves. Imported lazily so
+    # CPU-only invocations don't pay the import cost.
+    cuda_sync = None
+    if measure_gpu:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                cuda_sync = torch.cuda.synchronize
+        except ImportError:
+            pass
+
     with sampler_cm as gpu_sample:
         for _ in range(n_trials):
             t0 = time.perf_counter()
             last_result = run_fn()
+            if cuda_sync is not None:
+                cuda_sync()
             times.append(time.perf_counter() - t0)
 
     counts: OpCounts = ctx.counts
@@ -160,6 +200,7 @@ def bench_kernel(
 
     if gpu_sample is None:
         peak_hbm = peak_hbm_delta = gross_e = kern_e = mean_p = None
+        start_temp = mean_clock = None
         single_tenant = None
     else:
         peak_hbm = gpu_sample.peak_hbm_mb
@@ -167,6 +208,8 @@ def bench_kernel(
         gross_e = gpu_sample.gross_energy_j
         kern_e = gpu_sample.kernel_energy_j
         mean_p = gpu_sample.mean_power_w
+        start_temp = gpu_sample.start_temp_c
+        mean_clock = gpu_sample.mean_clock_mhz
         single_tenant = gpu_sample.single_tenant
 
     # true_idle_w is identical across every row from a single run; it
@@ -195,6 +238,8 @@ def bench_kernel(
         kernel_energy_j=kern_e,
         mean_power_w=mean_p,
         true_idle_w=true_idle,
+        start_temp_c=start_temp,
+        mean_clock_mhz=mean_clock,
         single_tenant=single_tenant,
         max_abs_err=max_err,
     )
