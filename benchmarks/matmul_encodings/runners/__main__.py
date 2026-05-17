@@ -35,6 +35,7 @@ import time
 from pathlib import Path
 
 from ._common import CKKS_PRESETS, BenchResult, make_context, write_csv
+from .gpu_sampler import GpuMonitor
 from .kernels import KERNEL_TABLE
 from .shapes import SHAPE_SETS
 
@@ -89,8 +90,34 @@ def main(argv: list[str] | None = None) -> int:
           f"n_trials={args.n_trials} warmup={args.warmup} "
           f"verify={args.verify}")
 
+    # GPU monitor setup. MUST run before make_context() so the
+    # true-idle baseline reflects "no FHE state allocated yet". The
+    # resident-idle baseline (idle with engine+keys loaded, used for
+    # kernel_energy_j subtraction) is sampled after make_context below.
+    gpu_monitor: GpuMonitor | None = None
+    if args.device == "gpu":
+        gpu_monitor = GpuMonitor.create(device_index=0)
+        if gpu_monitor is None:
+            print("[bench] WARNING: pynvml unavailable; GPU energy/memory "
+                  "columns will be empty.", flush=True)
+        elif gpu_monitor.true_idle_w is not None:
+            print(f"[bench] true idle (pre-ctx): "
+                  f"{gpu_monitor.true_idle_w:.2f} W")
+        else:
+            print(f"[bench] true idle unavailable "
+                  f"(energy counter: disabled)")
+
     ctx = make_context(args.backend, device=args.device, preset=args.ckks_preset)
     print(f"[bench] context: slots={ctx.slots} max_level={ctx.max_level}")
+
+    # Resident-idle baseline (engine + keys loaded). Used to compute
+    # kernel_energy_j -- the kernel's marginal energy above its
+    # already-loaded state.
+    if gpu_monitor is not None:
+        idle = gpu_monitor.calibrate_idle(duration_s=0.5)
+        if idle is not None:
+            print(f"[bench] resident idle (post-ctx): {idle:.2f} W "
+                  f"(used for kernel_energy_j subtraction)")
 
     rows: list[BenchResult] = []
     t0 = time.perf_counter()
@@ -104,6 +131,7 @@ def main(argv: list[str] | None = None) -> int:
                         ctx, shape,
                         n_trials=args.n_trials, warmup=args.warmup,
                         verify=args.verify, device=args.device,
+                        gpu_monitor=gpu_monitor,
                     )
                 except Exception as e:
                     print(f"[bench]   FAILED: {type(e).__name__}: {e}", flush=True)
@@ -112,13 +140,24 @@ def main(argv: list[str] | None = None) -> int:
                     f"err={r.max_abs_err:.2e}  " if r.max_abs_err is not None else ""
                 )
                 hbm_str = (
-                    f"hbm={r.peak_hbm_mb:.1f}MB  "
-                    if r.peak_hbm_mb is not None else ""
+                    f"hbm_d={r.peak_hbm_delta_mb:.1f}MB "
+                    f"(tot={r.peak_hbm_mb:.1f}MB)  "
+                    if r.peak_hbm_delta_mb is not None else ""
+                )
+                energy_str = (
+                    f"E_kern={r.kernel_energy_j:.3f}J  "
+                    f"E_gross={r.gross_energy_j:.3f}J  "
+                    f"P={r.mean_power_w:.1f}W  "
+                    if r.kernel_energy_j is not None else ""
+                )
+                tenancy_str = (
+                    "[CONTENDED] " if r.single_tenant is False else ""
                 )
                 print(
-                    f"[bench]   {r.mean_seconds*1000:.1f}ms ± "
+                    f"[bench]   {tenancy_str}"
+                    f"{r.mean_seconds*1000:.1f}ms ± "
                     f"{r.std_seconds*1000:.1f}ms  "
-                    f"{err_str}{hbm_str}"
+                    f"{err_str}{hbm_str}{energy_str}"
                     f"rot={r.rotations} ct.ct={r.ct_ct_muls} ct.pt={r.ct_pt_muls}",
                     flush=True,
                 )
