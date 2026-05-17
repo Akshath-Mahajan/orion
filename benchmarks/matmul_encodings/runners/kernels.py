@@ -92,9 +92,21 @@ def bench_bmm3(
     a_cts = bmm3_cipher.encrypt_chunks(ctx, a_chunks, n_he, ctx.max_level)
     b_cts = bmm3_cipher.encrypt_chunks(ctx, b_chunks, n_he, ctx.max_level)
 
-    def run():
-        return bmm3_cipher.bmm3_he_cached(
-            ctx, a_cts, b_cts, n, m, p, n_he, ctx.max_level,
+    if shape.mode == "cached":
+        def run():
+            return bmm3_cipher.bmm3_he_cached(
+                ctx, a_cts, b_cts, n, m, p, n_he, ctx.max_level,
+            )
+    elif shape.mode == "hoisted":
+        def run():
+            return bmm3_cipher.bmm3_he_hoisted(
+                ctx, a_cts, b_cts, n, m, p, n_he, ctx.max_level,
+                hoist_block_size=shape.hoist_block_size,
+            )
+    else:
+        raise ValueError(
+            f"bench_bmm3: unknown shape.mode={shape.mode!r}; "
+            f"expected 'cached' or 'hoisted'"
         )
 
     def verify_fn(ct_chunks: list) -> float:
