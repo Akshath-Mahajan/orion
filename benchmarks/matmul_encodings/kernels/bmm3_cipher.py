@@ -9,13 +9,36 @@ chunks. The kernel rotates these chunks in lockstep via the LongRot
 primitive, multiplies A-chunks by B-chunks per output position, and
 accumulates into ``stop = ceil(n*p / n_he)`` output chunks.
 
-This first port implements the **cached** mode (matmult/bmm3_cipher.go's
-``Bmm3ModeCached``): plaintext masks are encoded once per (start, end)
-key and reused across all m outer iterations and both A/B sides. The
-naive mode (re-encode on every call) bloats Lattigo's plaintext table to
-the point where Go panics on shapes larger than (5, 7, 11) at small
-n_he. The hoisted mode (block-hoisted rotations on top of the cache)
-is a follow-up commit.
+Two of Negar's three Go modes are ported:
+
+  * ``bmm3_he_cached``  — Bmm3ModeCached. Plaintext masks encoded once
+    per (start, end) and reused across all m iterations + both A/B
+    sides. Rotations issued one at a time inside ``_long_rot_he``.
+
+  * ``bmm3_he_hoisted`` — Bmm3ModeHoisted. Cached masks PLUS
+    block-hoisted Step-1 rotations on top. For every block of
+    ``hoist_block_size`` outer iterations we (1) walk the LongRot
+    Step-1 plan in plan-only mode via ``_build_plan`` to learn which
+    chunks need which rotation amounts, (2) take the union across the
+    block, (3) call ``ctx.rot_batch`` once per chunk to compute all
+    needed rotates in one ModUp + N keyswitches, (4) run the
+    block's ``hoist_block_size`` iterations of ``_bmm3_loop``, each
+    reading rotated chunks from the precomputed dict instead of
+    issuing individual rotates. (5) free the hoisted ciphertexts
+    before advancing to the next block.
+
+    Net rotation cost on a single LongRot drops from "one full
+    keyswitch per (chunk, v_tmp) pair" to "one ModUp per chunk +
+    one keyswitch per (chunk, v_tmp)". For the paper's BMM-III
+    sweep at n*m*p ~ 128^3 with hoist_block_size=16, the LongRot
+    Step-1 rotations dominate cached-mode wall-clock, so the
+    hoisted-mode speedup is substantial.
+
+The naive mode (re-encode masks on every call) is intentionally not
+ported: it bloated Lattigo's plaintext table enough to crash the Go
+runtime on shapes larger than (5, 7, 11) at small n_he during the
+session-1 port. Cached mode is the correctness baseline; hoisted
+mode is the paper preset.
 
 Lazy rescale + lazy relinearization
 -----------------------------------
@@ -189,6 +212,7 @@ def _long_rot_he(
     enc_len: int,
     n_he: int,
     mc: _MaskCache,
+    rotate_dict: dict[int, dict[int, int]] | None = None,
 ) -> list[int]:
     """Rotate the chunked logical vector by `rot`, return stop output cts.
 
@@ -196,6 +220,12 @@ def _long_rot_he(
       1. rotate each source chunk by v_tmp = rot mod n_he;
       2. stitch adjacent rotated chunks into output chunks;
       3. produce the (possibly partial) final output chunk.
+
+    If ``rotate_dict`` is provided, Step 1 reads pre-rotated chunks from
+    it (chunk_idx -> v_tmp -> ct_id) instead of calling ``ctx.rot``. The
+    dict must contain every (chunk_idx, v_tmp != 0) pair that Step 1
+    walks; ``_build_plan`` enumerates exactly that set and
+    ``_precompute_hoisted`` populates the dict via ``ctx.rot_batch``.
     """
     rot = _pos_mod(rot, enc_len)
     w = len(enc_cts)
@@ -214,6 +244,15 @@ def _long_rot_he(
         idx = _pos_mod(u + i, w)
         if v_tmp == 0:
             rotate_cts.append(enc_cts[idx])
+        elif rotate_dict is not None:
+            try:
+                rotate_cts.append(rotate_dict[idx][v_tmp])
+            except KeyError as e:
+                raise RuntimeError(
+                    f"_long_rot_he: hoist dict missing entry "
+                    f"(idx={idx}, v_tmp={v_tmp}); "
+                    f"_build_plan/_precompute_hoisted bug"
+                ) from e
         else:
             rotate_cts.append(ctx.rot(enc_cts[idx], v_tmp))
 
@@ -307,7 +346,159 @@ def _long_rot_he(
 
 
 # ---------------------------------------------------------------------------
-# BMM-III dispatcher (naive mode)
+# Hoisted-mode planning + precompute
+#
+# These two helpers implement the "hoisted" half of Bmm3ModeHoisted in
+# Negar's Go (matmult/bmm3_cipher.go::buildPlan + precomputeHoisted).
+# _build_plan walks LongRot Step 1 in plan-only mode and records which
+# chunks need which v_tmp values. _precompute_hoisted unions plans over a
+# block of outer iterations and issues one ctx.rot_batch per chunk so the
+# ModUp half of each key-switch is amortised across all v_tmp values for
+# that chunk.
+# ---------------------------------------------------------------------------
+
+
+def _build_plan(
+    rot: int,
+    output_len: int,
+    enc_len: int,
+    n_he: int,
+    w: int,
+) -> dict[int, set[int]]:
+    """Plan-only walk of LongRot Step 1: which chunk needs which v_tmp.
+
+    Returns chunk_idx -> set of distinct v_tmp values. Skips v_tmp == 0
+    (identity, no rotation needed). No ciphertexts touched.
+    """
+    rot = _pos_mod(rot, enc_len)
+    v = _pos_mod(rot, n_he)
+    u = rot // n_he
+    stop_length = (output_len + n_he - 1) // n_he
+    r_wrap = enc_len % n_he
+
+    needed: dict[int, set[int]] = {}
+    v_tmp = v
+    k = 1
+    i = 0
+    while i < stop_length + k:
+        idx = _pos_mod(u + i, w)
+        if v_tmp != 0:
+            needed.setdefault(idx, set()).add(v_tmp)
+        if idx == w - 1:
+            if v_tmp <= r_wrap:
+                v_tmp = _pos_mod(n_he - r_wrap + v_tmp, n_he)
+                if v_tmp == 0:
+                    k += 1
+            else:
+                v_tmp = _pos_mod(v_tmp - r_wrap, n_he)
+                k += 1
+        i += 1
+    return needed
+
+
+def _precompute_hoisted(
+    ctx: Context,
+    rots_block: Sequence[int],
+    output_len: int,
+    enc_len: int,
+    n_he: int,
+    enc_cts: list[int],
+) -> dict[int, dict[int, int]]:
+    """Hoist the Step-1 rotations needed by a block of LongRot calls.
+
+    For every (rot in rots_block) we run ``_build_plan`` to learn the
+    per-chunk shift sets, union them across the block, then call
+    ``ctx.rot_batch(enc_cts[idx], sorted_shifts)`` once per chunk so the
+    ModUp half of the key-switch is paid once per chunk regardless of
+    how many shifts that chunk needs.
+
+    Returns chunk_idx -> {v_tmp -> rotated_ct_id}. The caller is
+    responsible for calling ``ctx.free()`` on the returned ciphertexts
+    when the block is done (see ``bmm3_he_hoisted``).
+    """
+    w = len(enc_cts)
+
+    union: dict[int, set[int]] = {}
+    for rot in rots_block:
+        per = _build_plan(rot, output_len, enc_len, n_he, w)
+        for idx, vset in per.items():
+            union.setdefault(idx, set()).update(vset)
+
+    hoisted: dict[int, dict[int, int]] = {}
+    for idx, vset in union.items():
+        if not vset:
+            continue
+        shifts = sorted(vset)
+        rotated = ctx.rot_batch(enc_cts[idx], shifts)
+        hoisted[idx] = dict(zip(shifts, rotated))
+    return hoisted
+
+
+# ---------------------------------------------------------------------------
+# Per-iteration body (shared by cached + hoisted)
+# ---------------------------------------------------------------------------
+
+
+def _bmm3_loop(
+    ctx: Context,
+    a_cts: list[int],
+    b_cts: list[int],
+    rot_a: int,
+    rot_b: int,
+    nm: int,
+    mp: int,
+    np_: int,
+    n_he: int,
+    mc: _MaskCache,
+    rotate_dict_a: dict[int, dict[int, int]] | None,
+    rotate_dict_b: dict[int, dict[int, int]] | None,
+    dest: list[int | None],
+) -> list[int | None]:
+    """One outer-iteration body: LongRot A, LongRot B, accumulate
+    ``a_rot[s] * b_rot[s]`` into ``dest[s]`` for every output chunk s.
+
+    Lazy: ``ctx.mul_nr`` (degree-2 product, no relin) + ``ctx.add``
+    (preserves degree). Rescale and Relinearize are deferred to the
+    caller's finalize step.
+
+    ``rotate_dict_a`` / ``rotate_dict_b`` are forwarded to ``_long_rot_he``
+    -- ``None`` means cached mode (issue rotations one at a time), a
+    populated dict means hoisted mode (read from precomputed map).
+    """
+    stop = (np_ + n_he - 1) // n_he
+
+    a_rot = _long_rot_he(
+        ctx, a_cts, rot_a, np_, nm, n_he, mc, rotate_dict=rotate_dict_a,
+    )
+    b_rot = _long_rot_he(
+        ctx, b_cts, rot_b, np_, mp, n_he, mc, rotate_dict=rotate_dict_b,
+    )
+
+    for s in range(stop):
+        prod = ctx.mul_nr(a_rot[s], b_rot[s])
+        if dest[s] is None:
+            dest[s] = prod
+        else:
+            dest[s] = ctx.add(dest[s], prod)
+    return dest
+
+
+def _bmm3_finalize(ctx: Context, dest: list[int | None]) -> list[int]:
+    """Rescale + Relinearize each accumulated dest chunk once.
+
+    Drops (deg 2, S^2, L-1) -> (deg 1, S, L-2). Independent of m.
+    """
+    out: list[int] = []
+    for s, ct in enumerate(dest):
+        assert ct is not None, f"dest[{s}] was never written"
+        ct = ctx.rescale(ct)
+        ct = ctx.relin(ct)
+        out.append(ct)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# BMM-III dispatchers (cached + hoisted)
 # ---------------------------------------------------------------------------
 
 
@@ -328,7 +519,9 @@ def bmm3_he_cached(
 
     Inner loop: ``m`` LongRot pairs + ``m * stop`` ct*ct multiplies (lazy
     relin). Finalize: ``stop`` Rescales + ``stop`` Relinearizes. Plaintext
-    masks are encoded once per (start, end) key and reused.
+    masks are encoded once per (start, end) key and reused. Rotations are
+    issued one at a time (no hoisting); see ``bmm3_he_hoisted`` for the
+    block-hoisted variant that amortises ModUp across rotations.
     """
     r = smallest_r(n, m, p)
     nm, mp, np_ = n * m, m * p, n * p
@@ -340,27 +533,81 @@ def bmm3_he_cached(
     for i in range(m):
         rot_a = _pos_mod(-i * n, nm)
         rot_b = _pos_mod((r * m - n) * i, mp)
+        dest = _bmm3_loop(
+            ctx, a_cts, b_cts, rot_a, rot_b,
+            nm, mp, np_, n_he, mc,
+            rotate_dict_a=None, rotate_dict_b=None, dest=dest,
+        )
 
-        a_rot = _long_rot_he(ctx, a_cts, rot_a, np_, nm, n_he, mc)
-        b_rot = _long_rot_he(ctx, b_cts, rot_b, np_, mp, n_he, mc)
+    return _bmm3_finalize(ctx, dest)
 
-        for s in range(stop):
-            # Lazy: degree-2 product, no rescale, no relin yet.
-            prod = ctx.mul_nr(a_rot[s], b_rot[s])
-            if dest[s] is None:
-                dest[s] = prod
-            else:
-                dest[s] = ctx.add(dest[s], prod)
 
-    # Finalize: one Rescale + one Relinearize per output chunk.
-    out: list[int] = []
-    for s in range(stop):
-        ct = dest[s]
-        assert ct is not None
-        ct = ctx.rescale(ct)
-        ct = ctx.relin(ct)
-        out.append(ct)
-    return out
+def bmm3_he_hoisted(
+    ctx: Context,
+    a_cts: list[int],
+    b_cts: list[int],
+    n: int,
+    m: int,
+    p: int,
+    n_he: int,
+    input_level: int,
+    hoist_block_size: int = 16,
+) -> list[int]:
+    """Run BMM-III in hoisted mode on encrypted chunks.
+
+    Identical numerics + op count to ``bmm3_he_cached``; the difference
+    is the per-block precompute that calls ``ctx.rot_batch`` once per
+    chunk so the ModUp half of each Step-1 keyswitch is paid once per
+    (block, chunk) instead of once per (iteration, chunk, v_tmp).
+
+    Negar's Go default is ``hoistBlockSize=8`` but her notes flag
+    ``16`` as best for larger dimensions on the paper sweep, so we
+    default to 16 here. Sweep at 8/16/32 if you want to characterise.
+
+    The per-block hoist dicts are freed before advancing to the next
+    block via ``ctx.free()`` so peak GPU memory grows like
+    ``O(hoist_block_size)`` rather than ``O(m)``.
+    """
+    if hoist_block_size <= 0:
+        hoist_block_size = 8
+    r = smallest_r(n, m, p)
+    nm, mp, np_ = n * m, m * p, n * p
+    stop = (np_ + n_he - 1) // n_he
+    mc = _MaskCache(ctx, n_he, input_level - 1)
+
+    rots_a = [_pos_mod(-i * n, nm) for i in range(m)]
+    rots_b = [_pos_mod((r * m - n) * i, mp) for i in range(m)]
+
+    dest: list[int | None] = [None] * stop
+
+    for base in range(0, m, hoist_block_size):
+        end = min(base + hoist_block_size, m)
+
+        hoisted_a = _precompute_hoisted(
+            ctx, rots_a[base:end], np_, nm, n_he, a_cts,
+        )
+        hoisted_b = _precompute_hoisted(
+            ctx, rots_b[base:end], np_, mp, n_he, b_cts,
+        )
+
+        for i in range(base, end):
+            dest = _bmm3_loop(
+                ctx, a_cts, b_cts, rots_a[i], rots_b[i],
+                nm, mp, np_, n_he, mc,
+                rotate_dict_a=hoisted_a, rotate_dict_b=hoisted_b,
+                dest=dest,
+            )
+
+        # Release the per-block hoist dicts before the next block
+        # allocates its own. ctx.free() is a no-op on lattigo (per the
+        # backend design) and a real DeleteCiphertext on desilo so GPU
+        # memory peak grows like O(hoist_block_size), not O(m).
+        for chunk_dict in (hoisted_a, hoisted_b):
+            for v_map in chunk_dict.values():
+                for ct in v_map.values():
+                    ctx.free(ct)
+
+    return _bmm3_finalize(ctx, dest)
 
 
 def decode_output(
@@ -385,13 +632,21 @@ def bmm3_he(
     B: np.ndarray,
     n_he: int | None = None,
     input_level: int | None = None,
+    *,
+    mode: str = "cached",
+    hoist_block_size: int = 16,
 ) -> np.ndarray:
-    """End-to-end: encrypt A and B, run the naive BMM-III kernel, decrypt to C.
+    """End-to-end: encrypt A and B, run the BMM-III kernel, decrypt to C.
 
     `A.shape == (n, m)`, `B.shape == (m, p)`. Requires (n, m, p) pairwise
     coprime (BMM-III precondition). When n_he is None, defaults to ctx.slots
     (the runner case); tests typically pass a smaller n_he to exercise the
     multi-chunk path with smaller matrices.
+
+    ``mode``  -- "cached" or "hoisted". Hoisted matches Negar's paper
+    preset (Bmm3ModeHoisted in matmult/bmm3_cipher.go).
+    ``hoist_block_size`` -- only used when mode="hoisted". Negar's
+    default is 8; her notes flag 16 as best for larger dimensions.
     """
     n, m = A.shape
     m2, p = B.shape
@@ -408,5 +663,13 @@ def bmm3_he(
     a_cts = encrypt_chunks(ctx, a_chunks, n_he, input_level)
     b_cts = encrypt_chunks(ctx, b_chunks, n_he, input_level)
 
-    out_cts = bmm3_he_cached(ctx, a_cts, b_cts, n, m, p, n_he, input_level)
+    if mode == "cached":
+        out_cts = bmm3_he_cached(ctx, a_cts, b_cts, n, m, p, n_he, input_level)
+    elif mode == "hoisted":
+        out_cts = bmm3_he_hoisted(
+            ctx, a_cts, b_cts, n, m, p, n_he, input_level,
+            hoist_block_size=hoist_block_size,
+        )
+    else:
+        raise ValueError(f"unknown bmm3 mode {mode!r}; use 'cached' or 'hoisted'")
     return decode_output(ctx, out_cts, n, p, n_he)

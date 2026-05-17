@@ -43,12 +43,23 @@ class Bmm1Shape:
 
 @dataclass(frozen=True)
 class Bmm3Shape:
-    """BMM-III: pairwise-coprime (n, m, p) matmul."""
+    """BMM-III: pairwise-coprime (n, m, p) matmul.
+
+    ``mode``: 'cached' or 'hoisted'. Negar's paper preset is hoisted.
+    ``hoist_block_size``: only meaningful for mode='hoisted'. Her notes
+    flag 16 as best for larger dimensions; sweep at 8/16/32 if you want
+    to characterise.
+    """
     n: int; m: int; p: int
+    mode: str = "hoisted"
+    hoist_block_size: int = 16
 
     @property
     def label(self) -> str:
-        return f"({self.n},{self.m},{self.p})"
+        tag = self.mode if self.mode == "cached" else (
+            f"hoisted/b={self.hoist_block_size}"
+        )
+        return f"({self.n},{self.m},{self.p})/{tag}"
 
 
 @dataclass(frozen=True)
@@ -105,15 +116,32 @@ BMM1_PAPER: Sequence[Bmm1Shape] = (
 
 
 BMM3_SMOKE: Sequence[Bmm3Shape] = (
-    Bmm3Shape(n=5, m=7, p=11),
+    # Tiny single-chunk shape just for CI / plumbing checks.
+    Bmm3Shape(n=5, m=7, p=11),  # default hoisted, block=16
+    # Multi-chunk smoke pair so cached vs hoisted is comparable on the
+    # same hardware before running the paper preset.
+    Bmm3Shape(n=64, m=67, p=65, mode="cached"),
+    Bmm3Shape(n=64, m=67, p=65, mode="hoisted", hoist_block_size=16),
 )
+
+# Paper preset mirrors matmult/bmm3_runner.go::BMM3CiphertextSuite and
+# Negar's notes: hoisted mode is the paper preset; she flags block sizes
+# 8 / 16 / 32 with 16 best for larger dimensions. We default every shape
+# to hoisted+16 (her recommendation) and add a block-size sweep at
+# (128, 131, 129) so D9 can include the cached-vs-hoisted and
+# block-size-tuning columns in the figure.
 BMM3_PAPER: Sequence[Bmm3Shape] = (
-    # Mirrors matmult/bmm3_runner.go::BMM3CiphertextSuite.
-    Bmm3Shape(n=128, m=131, p=129),
-    Bmm3Shape(n=256, m=259, p=257),
-    Bmm3Shape(n=512, m=515, p=513),
-    Bmm3Shape(n=1024, m=1027, p=1025),
-    # Bmm3Shape(n=2048, m=2051, p=2049),  # commented out in Go
+    # Paper-preset shapes at her recommended block size.
+    Bmm3Shape(n=128, m=131, p=129, mode="hoisted", hoist_block_size=16),
+    Bmm3Shape(n=256, m=259, p=257, mode="hoisted", hoist_block_size=16),
+    Bmm3Shape(n=512, m=515, p=513, mode="hoisted", hoist_block_size=16),
+    Bmm3Shape(n=1024, m=1027, p=1025, mode="hoisted", hoist_block_size=16),
+    # Bmm3Shape(n=2048, m=2051, p=2049, ...),  # commented out in Go
+    # Block-size sweep at the smallest paper shape so the cached vs
+    # hoisted comparison + block-size tuning data lands in one CSV.
+    Bmm3Shape(n=128, m=131, p=129, mode="cached"),
+    Bmm3Shape(n=128, m=131, p=129, mode="hoisted", hoist_block_size=8),
+    Bmm3Shape(n=128, m=131, p=129, mode="hoisted", hoist_block_size=32),
 )
 
 
