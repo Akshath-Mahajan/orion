@@ -144,6 +144,18 @@ class CheddarLibrary:
         self._hoist_mode = self._HOIST_MODE_BY_NAME[hoist_mode]
         self._hoist_mode_name = hoist_mode
 
+        # ORION_CHEDDAR_POW2_ROTATE=1: instead of a dedicated native key per
+        # exact (per-layer, BSGS-derived) rotation distance, decompose every
+        # rotation into a chain over a fixed universal power-of-two key set
+        # (~log2(slots) keys total, shared by every layer and never
+        # regenerated). Trades a large chunk of resident key memory --
+        # ResNet20's per-layer keys are the dominant cost, see
+        # RESNET_MEMORY.md -- for more rotations per layer (up to
+        # log2(slots) native HRot calls instead of 1 per BSGS distance).
+        # Default off: unchanged exact-key behavior.
+        env = os.environ.get("ORION_CHEDDAR_POW2_ROTATE", "").lower()
+        self._pow2_rotate = env in ("1", "true", "yes", "on")
+
         self._default_scale: int | None = None
         self._max_level: int | None = None
         self._slots: int | None = None
@@ -481,6 +493,47 @@ class CheddarLibrary:
         # Keys are generated lazily inside the native RotateNew.
         return _native.RotateNew(int(ct_id), int(k))
 
+    def _pow2_universal_keys(self) -> list[int]:
+        """Fixed key set used by _rotate_lt in pow2 mode: every power of
+        two up to (but not including) the full slot count. log2(slots)
+        keys total, shared by every layer -- never grows with network
+        depth or per-layer diagonal count, unlike exact BSGS distances."""
+        keys = []
+        p = 1
+        while p < self._slots:
+            keys.append(p)
+            p *= 2
+        return keys
+
+    def _rotate_lt(self, ct_id: int, k: int) -> int:
+        """Rotate by k for linear-transform evaluation. Exact mode (default)
+        just calls RotateNew, which lazily generates a dedicated key for
+        this exact distance. Pow2 mode (ORION_CHEDDAR_POW2_ROTATE=1)
+        instead decomposes k into a chain of rotations over the fixed
+        universal power-of-two key set -- more native HRot calls per
+        logical rotation (up to log2(slots), one per set bit), but the
+        key set stops growing with network depth. See __init__.
+        """
+        if k == 0:
+            return ct_id
+        if not self._pow2_rotate:
+            return self.RotateNew(ct_id, k)
+
+        current = ct_id
+        owns_current = False
+        power = 1
+        remaining = k
+        while remaining:
+            if remaining & 1:
+                nxt = self.RotateNew(current, power)
+                if owns_current:
+                    self.DeleteCiphertext(current)
+                current = nxt
+                owns_current = True
+            remaining >>= 1
+            power *= 2
+        return current
+
     def RotateBatchNew(self, ct_id: int, ks: Sequence[int]) -> list[int]:
         """N rotations of one ciphertext.
 
@@ -552,6 +605,13 @@ class CheddarLibrary:
             math.sqrt(len(t["diags"]) * float(t["bsgs_ratio"]))))
 
     def GetLinearTransformRotationKeys(self, lt_id: int) -> list[int]:
+        # Pow2 mode never needs per-layer exact distances -- _rotate_lt
+        # composes any rotation from the fixed universal set instead, so
+        # pre-generating the exact BSGS distances here would just waste
+        # memory on keys _eval_lt_{naive,bsgs} will never call RotateNew
+        # with directly.
+        if self._pow2_rotate:
+            return self._pow2_universal_keys()
         diags = self._transforms[lt_id]["diags"]
         if not self._lt_use_bsgs(lt_id):
             return sorted(k for k in diags if k != 0)
@@ -581,7 +641,7 @@ class CheddarLibrary:
         level = self.GetCiphertextLevel(ct_id)
         result = None
         for k, vals in diags.items():
-            rotated = ct_id if k == 0 else self.RotateNew(ct_id, k)
+            rotated = self._rotate_lt(ct_id, k)
             pt = self._lt_encode(vals, level)
             prod = self.MulPlaintextNew(rotated, pt)
             self.DeletePlaintext(pt)
@@ -601,8 +661,7 @@ class CheddarLibrary:
 
         needed_babies = sorted({b for group in giant_groups.values()
                                 for b, _ in group})
-        baby_rots = {b: (ct_id if b == 0 else self.RotateNew(ct_id, b))
-                    for b in needed_babies}
+        baby_rots = {b: self._rotate_lt(ct_id, b) for b in needed_babies}
 
         result = None
         for g, group in giant_groups.items():
@@ -614,7 +673,7 @@ class CheddarLibrary:
                 self.DeletePlaintext(pt)
                 inner = prod if inner is None else self._lt_accumulate(inner, prod)
 
-            partial = inner if g == 0 else self.RotateNew(inner, g * bs)
+            partial = self._rotate_lt(inner, g * bs)
             if partial is not inner:
                 self.DeleteCiphertext(inner)
             result = partial if result is None else self._lt_accumulate(result, partial)
