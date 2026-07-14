@@ -788,6 +788,13 @@ class CheddarLibrary:
         """Exact resident evaluation-key memory (rotation + basic evks)."""
         return _native.GetKeyMemoryMB()
 
+    def GetPeakDeviceMemoryMB(self) -> float:
+        """Peak bytes ever allocated through the scheme's RMM pool -- keys,
+        ciphertexts, everything, not just evaluation keys. See
+        MemoryPool.h; measures the true footprint even when
+        ORION_CHEDDAR_MANAGED_MEMORY pages part of it to host RAM."""
+        return _native.GetPeakDeviceMemoryMB()
+
     def GetModuliChain(self) -> list[int]:
         """Usable-level moduli (q_i), indexed by Orion level 0..max_level.
 

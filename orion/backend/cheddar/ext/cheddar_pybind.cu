@@ -16,6 +16,7 @@
 
 #include <UserInterface.h>
 #include <core/Context.h>
+#include <core/MemoryPool.h>
 #include <extension/BootContext.h>
 
 #include <pybind11/pybind11.h>
@@ -982,6 +983,15 @@ double GetKeyMemoryMB() {
     return static_cast<double>(words) * sizeof(word) / (1024.0 * 1024.0);
 }
 
+// Peak bytes ever allocated through the RMM pool backing the current
+// scheme (see MemoryPool.h) -- includes keys, ciphertexts and every other
+// device buffer, not just evaluation keys like GetKeyMemoryMB. Measures
+// the true footprint regardless of whether ORION_CHEDDAR_MANAGED_MEMORY
+// is paging part of it to host RAM.
+double GetPeakDeviceMemoryMB() {
+    return static_cast<double>(cheddar::GetPeakDeviceBytes()) / (1024.0 * 1024.0);
+}
+
 int GetCiphertextLevel(int ct_id) { return level_of(g_state.ct(ct_id)); }
 int GetPlaintextLevel(int pt_id) { return level_of(g_state.pt(pt_id)); }
 int GetCiphertextSlots(int /*ct_id*/) { return g_state.slot_count; }
@@ -1088,6 +1098,7 @@ PYBIND11_MODULE(_cheddar_native, m) {
 
     // Metadata
     m.def("GetKeyMemoryMB", &GetKeyMemoryMB);
+    m.def("GetPeakDeviceMemoryMB", &GetPeakDeviceMemoryMB);
     m.def("GetCiphertextLevel", &GetCiphertextLevel, py::arg("ct_id"));
     m.def("GetPlaintextLevel", &GetPlaintextLevel, py::arg("pt_id"));
     m.def("GetCiphertextSlots", &GetCiphertextSlots, py::arg("ct_id"));
