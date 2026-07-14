@@ -881,10 +881,17 @@ void NewBootstrapper(int /*num_cts_levels*/, int /*num_stc_levels*/,
 
 int Bootstrap(int ct_id, int slots) {
     ensure_keys();
-    if (!g_state.boot_context || !g_state.boot_prepared_slots.count(slots))
-        throw std::runtime_error(
-            "Cheddar: no bootstrapper prepared for slots=" +
-            std::to_string(slots) + ". Call NewBootstrapper first.");
+    // Orion's placement generates bootstrappers for the slot counts it
+    // decides on, but runtime ops can request a count that was never
+    // placed (observed: ResNet20's conv1 requests logslots-15 when
+    // placement only generated 14/13/12). Unlike desilo's slot-agnostic
+    // key, Cheddar's FFT tables + rotation keys are per-slot-count, so
+    // prepare on demand here rather than surfacing the placement gap as
+    // a crash. NewBootstrapper is idempotent (no-ops if already
+    // prepared) and throws its own clear error if boot_context is
+    // missing entirely.
+    if (!g_state.boot_prepared_slots.count(slots))
+        NewBootstrapper(0, 0, 0, slots);
 
     // Scale snapping. Cheddar's Boot derives its EvalMod scaleup from the
     // scheme's fixed base_scale, i.e. it assumes the input sits at exactly
