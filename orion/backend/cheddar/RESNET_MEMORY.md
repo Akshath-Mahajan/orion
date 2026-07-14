@@ -157,6 +157,66 @@ is not repeated here). It is now committed in both repos:
   an explicit `-Wl,--no-as-needed <path>/libfmt.so` to the `cheddar`
   target's link flags in `CMakeLists.txt`.
 
+## Why desilo needs so much less memory
+
+Same network, same CKKS params (`configs/resnet_desilo.yml`, LogN=16,
+same LogQ/LogP/scale/H), same measurement script
+(`examples/measure_resnet_memory.py`), on the same GPU. Note:
+`resnet_desilo.yml` had no `device: gpu` set — Orion defaults `device` to
+`"cpu"` (`OrionParameters.device`), so running it as-shipped silently
+measures a CPU run (near-zero "GPU memory" for the wrong reason). Fixed
+in this branch; re-run with `device: gpu` added:
+
+| Phase | Cumulative | Increment |
+|---|---|---|
+| Baseline (engine + secret/public/relin/rotation/conj keys) | 4.1 GB | — |
+| + diagonal generation (all layers) | 4.1 GB | +0 |
+| + boot circuits (3 slot counts) | 16.5 GB | +12.4 GB |
+| + conv1 (stem) | 16.6 GB | +0.12 GB |
+| + everything else (19 more conv/linear/shortcut layers + avgpool) | 16.6 GB | **+0.05 GB total** |
+
+**Total: ~16.6 GB** — comfortably under 24 GB, vs cheddar's 89.5 GB.
+Two separate mechanisms drive this, both visible directly in
+`orion/backend/desilo/bindings.py`:
+
+1. **One rotation key covers the whole network.**
+   `GenerateEvaluationKeys()` calls `engine.create_rotation_key(self._sk)`
+   *once*, during initial key generation, before `compile()` even starts.
+   `AddRotationKey()` — the hook cheddar uses to add a new per-distance
+   key for every layer — is a no-op for desilo:
+   `pass  # General rotation key already covers all deltas`. Every
+   `Rotate`/`RotateNew` call for any layer, any distance, reuses that one
+   key. Cheddar instead generates a distinct key per required rotation
+   distance *per layer* (`AddRotationKey` → `PrepareRotationKey`), so its
+   cost scales with network depth and shape diversity; desilo's doesn't
+   scale with either. This is the entire explanation for the ~75 GB gap
+   in the per-layer body of the network (conv1 through the final linear
+   layer): cheddar added ~74.9 GB there, desilo added ~0.17 GB.
+
+2. **Desilo already evicts its bootstrap key** — the thing cheddar's
+   `RemoveRotationKeys` docstring says has "no release path." Every
+   `NewBootstrapper(slots)` call explicitly deletes the previous
+   `_boot_key` and runs `gc.collect()` before creating the new one
+   (`bindings.py:774-781`, comment: *"each key is ~12GB on GPU"*), so only
+   *one* boot key is ever resident, not one per slot count. That's why
+   "boot circuits" only added 12.4 GB here despite 3 distinct slot counts
+   being requested (16384/8192/4096), vs cheddar which keeps all 3
+   resident simultaneously.
+
+**The caveat this measurement doesn't cover:** desilo's boot-key eviction
+means that if inference ever needs to bootstrap at a slot count *other
+than* the currently-resident one, it must regenerate a ~12 GB key on the
+spot. For a plain feedforward network like ResNet20, spatial resolution
+only shrinks monotonically (32→16→8), so this should cost at most 2 extra
+regenerations across the whole forward pass — but that's an assumption,
+not something this compile()-only measurement verifies. More broadly,
+this doc only measures memory: desilo's rotation model has its own
+compute-side tradeoffs (lazy-relin, rotate_batch) that a memory-only
+comparison doesn't capture — a single universal rotation key plausibly
+costs more compute per rotation than a dedicated per-distance key would.
+A fair backend comparison needs wall-clock inference numbers alongside
+these memory numbers, not memory alone.
+
 ## Open decisions
 
 1. ~~**Boot-slot crash:** apply the lazy-prepare fix~~ — **done**.
