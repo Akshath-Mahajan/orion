@@ -748,6 +748,11 @@ class CheddarLibrary:
         coeffs, kind = self._polynomials[poly_id]
         if kind == "chebyshev":
             coeffs = np.polynomial.chebyshev.cheb2poly(coeffs).tolist()
+        # EvalPoly (native, log-depth) requires degree >= 2; below that
+        # Horner's method is already both cheap and exact.
+        if len(coeffs) - 1 >= 2:
+            return _native.EvaluatePolynomialNative(
+                int(ct_id), coeffs, float(scale))
         return self._eval_monomial(ct_id, coeffs)
 
     def _eval_monomial(self, ct_id: int, coeffs: list[float]) -> int:

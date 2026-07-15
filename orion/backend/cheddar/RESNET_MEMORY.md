@@ -217,28 +217,130 @@ costs more compute per rotation than a dedicated per-distance key would.
 A fair backend comparison needs wall-clock inference numbers alongside
 these memory numbers, not memory alone.
 
+## ResNet20 now runs end-to-end
+
+The blockers below (headline finding 1's ~90 GB footprint being the
+exception) are fixed. `examples/run_resnet.py configs/resnet_cheddar.yml`
+(with `ORION_CHEDDAR_POW2_ROTATE=1 ORION_CHEDDAR_BOOT_MIN_KS=1` — the
+universal power-of-two rotation-key mode, which is what makes the
+per-layer rotation-key memory tractable enough to fit and run) completes
+real FHE inference, verified reproducibly across three independent runs:
+
+| Run | Bootstraps | MAE | Precision | Runtime |
+|---|---|---|---|---|
+| 1 | 75 | 0.0008 | 10.32 bits | 376.5 s |
+| 2 | 75 | 0.0008 | 10.30 bits | 370.3 s |
+| 3 (final, audited change set) | 75 | 0.0008 | 10.27 bits | 389.0 s |
+
+For comparison, desilo (`configs/resnet_desilo.yml`, same network/params,
+`device: gpu` fixed per the note above):
+
+| Backend | Bootstraps | MAE | Precision | Runtime |
+|---|---|---|---|---|
+| desilo | 56 | 0.0008 | 10.25 bits | 261.1 s |
+| cheddar (pow2-rotate) | 75 | 0.0008 | ~10.3 bits | ~370-390 s |
+
+Desilo needs 19 fewer bootstraps and runs ~40-50% faster. Two distinct
+reasons, not one:
+
+- **Fewer bootstraps:** cheddar's `Boot()` only restores a ciphertext to
+  `l_eff - num_stc_levels - 1` (measured: 10 - 3 - 1 = 6), because
+  SlotToCoeff's cost eats into the usable chain from the top rather than
+  being reserved above it the way CoeffToSlot/EvalMod's cost is (see
+  `BootContext::Create`'s level-budget assert). Each cheddar bootstrap
+  therefore buys back less usable depth than whatever desilo's (closed,
+  unauditable) engine does, so Orion's placement needs more of them to
+  cover the same network. This is architectural, not a rotation-mode
+  artifact.
+- **More rotation operations per bootstrap:** desilo's one universal
+  rotation key rotates by *any* distance in a single operation; cheddar's
+  pow2 mode only generates power-of-two keys, so every rotation — inside
+  bootstrap's own CtS/StC circuit *and* every linear-transform layer —
+  gets decomposed into up to `log2(slots) ≈ 15` sub-rotations. This is
+  the actual compute cost of the pow2 memory-for-compute tradeoff this
+  branch introduced, and it's the answer to the original "what's the
+  compute cost of pow2 rotation?" question this investigation set out to
+  measure.
+
+### What was actually broken (three layered bugs, each masking the next)
+
+1. **Boot-slot mismatch, a deeper case than the one already fixed above.**
+   Even with the lazy-prepare fix, `Bootstrap()`'s "already prepared"
+   check compared against Python's *heuristic* slot-count argument, which
+   can diverge from the ciphertext's real `GetNumSlots()` once Cheddar's
+   own `Max()`-based NumSlots propagation has run on it. Fixed by keying
+   the check off the ciphertext's actual value — the same thing `Boot()`
+   itself reads internally, never the wrapper's argument.
+
+2. **Bootstrap-placement level model** (`orion/core/level_dag.py`).
+   Orion's shortest-path bootstrap placement assumes a bootstrap edge can
+   restore a ciphertext fully to `l_eff`. Cheddar's `Boot()` can't (see
+   above). Without a cap on this, placement targets levels cheddar can't
+   deliver and crashes downstream. **Confirmed load-bearing by ablation:**
+   removing the cap and re-running reproduces a crash — `AXYPBZ: Invalid
+   levels`, thrown deep inside `EvalPoly`'s internal tree construction —
+   a different failure signature than the original `RescaleNew:
+   ciphertext already at level 0`, but the same root cause caught at a
+   different point once the polynomial evaluator changed underneath it.
+3. **No native polynomial evaluator** (`orion/backend/cheddar/bindings.py`,
+   `cheddar_pybind.cu`). `EvaluatePolynomial` only had a pure-Python
+   Horner's-method fallback, costing one level per polynomial
+   coefficient. The composite Sign/ReLU activation's default degrees
+   (15/15/27) need 15/15/27 levels via Horner against a total budget of
+   ~10 — infeasible regardless of bootstrap placement, since bootstraps
+   never happen mid-polynomial. Fixed by binding Cheddar's own native
+   `EvalPoly` (a log-depth BSGS-tree evaluator, already used internally by
+   bootstrap's own `EvalMod`) for degree >= 2, bringing the cost down to
+   the ~4/4/5 levels the rest of Orion already assumed. This also
+   uncovered a one-line upstream bug in `EvalPoly.cpp` (a transposed
+   `EncodeConstant(level, scale, ...)` argument pair in exactly one of 7
+   call sites in the file), fixed separately in
+   `matmul-encoding-material/cheddar`'s `orion-patches` branch.
+
+### A wrong hypothesis that "worked" but wasn't needed (removed from history)
+
+While chasing the level-0 crash, the working hypothesis was that
+bootstrap needed the ciphertext to be *genuinely* sparse (fewer real
+slots than the ring size) rather than always padded to full slots, since
+Cheddar derives NumSlots from the encoded message's own length. This led
+to an opt-in `pack_slots` parameter on `encoder.encode()` plus a
+`SetCiphertextNumSlots` binding so `Bootstrap.forward()` could correct a
+ciphertext's tracked NumSlots after its prescale multiply (which can only
+grow NumSlots via `Max(ct, pt)`, never shrink it).
+
+This worked in the sense that it made ciphertexts genuinely sparse for
+bootstrap (verified via instrumentation) — but the level-0 crash
+persisted anyway, disproving the hypothesis (the real cause was item 2
+above). Once the real fixes landed, an ablation test — reverting
+`pack_slots`/`SetCiphertextNumSlots` and re-running full inference —
+confirmed ResNet20 still completes correctly without it (MAE 0.0008,
+matching every other run). Since it added real complexity for no
+correctness benefit, it was removed entirely, including from git history
+(the commit that introduced it was local-only, never pushed, so it was
+dropped via `git reset --soft` off the branch tip rather than reverted
+forward).
+
+If sparse-slot bootstrap tracking turns out to matter for *memory*
+specifically — a genuinely sparse bootstrap plausibly needs a smaller
+`BootContext` than a full-slot one — that's a separate, unmeasured
+question this ablation didn't test; it only tested correctness.
+
 ## Open decisions
 
 1. ~~**Boot-slot crash:** apply the lazy-prepare fix~~ — **done**.
 2. ~~**Shared clone:** persist managed memory as an env-gated opt-in~~ —
    **done**, see above.
-3. **How to actually get ResNet20 running:** per headline finding 3,
-   `io_mode`-style rotation-key streaming *cannot* fit this on its own (the
-   preamble + conv1 already exceed 24 GB), so the real choices are (a)
-   managed memory alone — already proven to work for `compile()`, expect a
-   real slowdown from host-RAM page traffic during inference (unmeasured
-   so far), or (b) `io_mode` implemented *in combination with* managed
-   memory, to shrink the ~65 GB of required paging down to as little as
-   ~4 GB — but cheddar has no key-eviction path at all today (`
-   RemoveRotationKeys`/`RemovePlaintextDiagonals` are no-ops — "no release
-   path"), rotation keys are shared between the LT and Boot subsystems
-   (same `EvkMap`, so naive eviction risks breaking a bootstrap that
-   reuses a key an evicted layer needed), and it must be stage/dedup-aware
-   rather than naively per-layer (see finding 3). Not started.
-4. **Inference-time behavior is unmeasured.** Everything above is from
-   `compile()` only. Actual bootstrap execution (38 ops) under managed
-   memory — correctness, peak memory, and especially wall-clock time from
-   page-fault traffic — still needs a real run.
+3. ~~**How to actually get ResNet20 running**~~ — **done**, via
+   `ORION_CHEDDAR_POW2_ROTATE=1` plus the three fixes above; see "ResNet20
+   now runs end-to-end". The ~90 GB exact-mode footprint (headline finding
+   1) is unchanged and still doesn't fit on a 24 GB card — pow2-rotate
+   mode is what actually made this run, trading rotation-key memory for
+   more rotation operations per bootstrap.
+4. ~~**Inference-time behavior is unmeasured**~~ — **done**, see the
+   table above. Not yet done: a true head-to-head pow2-vs-exact-mode
+   compute-cost comparison *on cheddar itself* — exact mode still can't
+   compile ResNet20 at all (headline finding 1), so that comparison would
+   need a smaller network or a memory-relaxed setup to be apples-to-apples.
 
 ## Reproduce the measurement
 

@@ -18,6 +18,7 @@
 #include <core/Context.h>
 #include <core/MemoryPool.h>
 #include <extension/BootContext.h>
+#include <extension/EvalPoly.h>
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -891,8 +892,23 @@ int Bootstrap(int ct_id, int slots) {
     // a crash. NewBootstrapper is idempotent (no-ops if already
     // prepared) and throws its own clear error if boot_context is
     // missing entirely.
-    if (!g_state.boot_prepared_slots.count(slots))
-        NewBootstrapper(0, 0, 0, slots);
+    //
+    // Deliberately ignore the caller's `slots` argument for this check
+    // and use the ciphertext's own GetNumSlots() instead. Orion's
+    // Python-side "slots" is a heuristic computed independently from
+    // tensor shape metadata (see tensors.py's bootstrap()); it can
+    // diverge from what the native ciphertext actually carries once
+    // enough ops have propagated through Cheddar's own NumSlots tracking
+    // (see e.g. EvalPoly.cpp/Hoist.cu taking Max() of operand NumSlots).
+    // BootContext::Boot() itself only ever looks at input.GetNumSlots()
+    // (never the slots this wrapper receives), so preparing based on
+    // anything else can silently miss the real requirement -- observed
+    // on ResNet: Python requested slots=16384 (already prepared), but
+    // the ciphertext's actual GetNumSlots() was 32768 (never prepared),
+    // and Boot() crashed on that real value with no lazy-prepare chance.
+    int actual_slots = g_state.ct(ct_id).GetNumSlots();
+    if (!g_state.boot_prepared_slots.count(actual_slots))
+        NewBootstrapper(0, 0, 0, actual_slots);
 
     // Scale snapping. Cheddar's Boot derives its EvalMod scaleup from the
     // scheme's fixed base_scale, i.e. it assumes the input sits at exactly
@@ -934,6 +950,43 @@ int Bootstrap(int ct_id, int slots) {
     int corrected = RescaleNew(scaled);
     g_state.ciphertexts.erase(scaled);
     return corrected;
+}
+
+// ---------------------------------------------------------------------------
+// Polynomial evaluation (native EvalPoly)
+// ---------------------------------------------------------------------------
+// Cheddar's own EvalPoly (extension/EvalPoly.h) already implements a
+// log-depth (BSGS-tree) polynomial evaluator -- the same one BootContext
+// uses internally for EvalMod. bindings.py's GenerateMonomial /
+// GenerateChebyshev previously only fed a pure-Python Horner's-method
+// fallback (O(degree) levels: one Ct-Ct multiply + rescale per
+// coefficient), which silently diverged from the ceil(log2(degree+1))
+// depth orion/nn/activation.py assumes when placing bootstraps -- fine
+// for the tiny (degree <= 3) iterative-sign polynomials, but the
+// composite Sign/ReLU minimax polynomials default to degrees [15, 15, 27],
+// consuming 15/15/27 levels via Horner vs. the 4/4/5 EvalPoly (and the
+// depth model) actually expect -- exceeding the entire level budget
+// (l_eff=10) inside a single polynomial evaluation, making the network
+// unplaceable no matter how bootstraps are scheduled. EvalPoly requires
+// degree >= 2 (asserts otherwise), so bindings.py keeps the Horner path
+// for degree < 2.
+int EvaluatePolynomialNative(int ct_id, std::vector<double> coeffs,
+                             double target_scale) {
+    ensure_keys();
+    const Ct& c = g_state.ct(ct_id);
+    if (c.HasRx())
+        throw std::runtime_error(
+            "EvaluatePolynomialNative: relinearize before evaluating a "
+            "polynomial.");
+
+    cheddar::EvalPoly<word> poly(coeffs, level_of(c), c.GetScale(),
+                                 target_scale, /*chebyshev=*/false);
+    poly.Compile(g_state.context);
+
+    auto out = std::make_unique<Ct>();
+    poly.Evaluate(g_state.context, *out, c,
+                 g_state.iface->GetMultiplicationKey());
+    return g_state.put_ct(std::move(out));
 }
 
 void DeleteBootstrappers() {
@@ -1091,6 +1144,10 @@ PYBIND11_MODULE(_cheddar_native, m) {
     m.def("Bootstrap", &Bootstrap, py::arg("ct_id"), py::arg("slots"));
     m.def("DeleteBootstrappers", &DeleteBootstrappers);
     m.def("BootNumEvalModLevels", &BootNumEvalModLevels);
+
+    // Polynomial evaluation
+    m.def("EvaluatePolynomialNative", &EvaluatePolynomialNative,
+          py::arg("ct_id"), py::arg("coeffs"), py::arg("target_scale"));
 
     // Lifecycle: ID deletion
     m.def("DeleteCiphertext", &DeleteCiphertext, py::arg("ct_id"));
