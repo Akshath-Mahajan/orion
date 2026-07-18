@@ -254,6 +254,16 @@ class LevelDAG(nx.DiGraph):
             # so the solver can't place a bootstrap targeting a level
             # cheddar can't actually deliver, instead of silently running
             # out of levels partway through whatever comes next.
+            #
+            # Cheddar's BootContext could instead give StC its own reserved
+            # primes (like CtS/EvalMod already have) so Boot() restores
+            # fully to l_eff -- see the GetStCStartLevel()/GetEndLevel()
+            # comment in the vendored BootContext.cpp. That cuts ResNet20's
+            # bootstrap count nearly in half (75 -> 38) but is a net
+            # latency loss (51.4s vs 36.0s): the wider reserved-prime chain
+            # and the higher post-boot level both make every op between
+            # bootstraps costlier, more than offsetting having fewer of
+            # them. Deliberately not done here for that reason.
             if prev_module.scheme.params.get_backend() == "cheddar":
                 num_stc_levels = prev_module.scheme.params.get_boot_num_stc_levels() or 0
                 max_post_boot_level = self.l_eff - num_stc_levels - 1

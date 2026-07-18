@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <set>
@@ -866,6 +867,34 @@ void NewBootstrapper(int /*num_cts_levels*/, int /*num_stc_levels*/,
         g_state.eval_mod_prepared = true;
     }
     if (g_state.boot_prepared_slots.count(slots)) return;
+
+    // ORION_CHEDDAR_BOOT_EVICT=1: keep at most one slot count's
+    // CoeffToSlot/SlotToCoeff data (BootContext's eval_fft_) resident at a
+    // time, evicting every other prepared slot count before preparing this
+    // one. In pow2-rotate mode this is where nearly all boot-circuit memory
+    // actually lives (see RESNET_MEMORY.md) -- the rotation keys pow2 mode
+    // uses are a small, fixed, slot-count-independent set (never evicted
+    // here), so this never frees a key another slot count still needs.
+    // Orion's placement generates all of a network's boot slot counts
+    // during compile(), before inference starts, so without this a network
+    // needing N slot counts keeps all N resident simultaneously -- fine
+    // for small N, but ResNet20's 4 distinct slot counts (32768 lazily,
+    // plus the 3 placement generates) is enough to OOM a 24GB card once
+    // num_stc_levels shrinks (bigger StC BSGS blocks -> bigger eval_fft_
+    // per slot count). Safe for any network whose slot count only shrinks
+    // over the forward pass (true for ResNet-style feedforward nets); a
+    // network that revisits an evicted slot count just regenerates it
+    // (extra latency, not incorrect -- PrepareEvalSpecialFFT is
+    // idempotent/deterministic).
+    static const bool evict_boot_circuits = [] {
+        const char *v = std::getenv("ORION_CHEDDAR_BOOT_EVICT");
+        return v && std::string(v) != "" && std::string(v) != "0";
+    }();
+    if (evict_boot_circuits) {
+        for (int prev : g_state.boot_prepared_slots)
+            g_state.boot_context->RemoveEvalSpecialFFT(prev);
+        g_state.boot_prepared_slots.clear();
+    }
 
     g_state.boot_context->PrepareEvalSpecialFFT(slots);
 

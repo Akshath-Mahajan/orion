@@ -218,15 +218,17 @@ class CheddarLibrary:
         # needs (num_cts_levels/num_stc_levels/log_message_ratio) come
         # from boot_params separately.
         #
-        # Bootstrap is enabled iff num_cts_levels *and* num_stc_levels are
-        # explicitly given in boot_params. When enabled, the topmost
-        # (num_cts_levels + eval_mod_levels) primes of the chain are
-        # reserved for the boot circuit (CoeffToSlot + EvalMod) and are
-        # NOT part of Orion's usable level range -- BootContext asserts
-        # default_encryption_level == max_level - num_cts_levels -
-        # GetNumEvalModLevels(). This mirrors how lattigo silently extends
-        # its modulus chain for the bootstrap circuit: Orion's LogQ is the
-        # usable chain; the reserved primes sit above it.
+        # Only num_cts_levels + eval_mod_levels primes are reserved above
+        # the usable chain -- StC eats into the usable chain itself, so
+        # Boot() restores to at most l_eff - num_stc_levels rather than
+        # l_eff. Deliberate: giving StC its own reserved primes too (so
+        # Boot() restores fully to l_eff) works and cuts ResNet20's
+        # bootstrap count nearly in half (75 -> 38, see BootContext.cpp's
+        # comment on the GetStCStartLevel()/GetEndLevel() anchor), but it's
+        # a net latency loss -- measured 51.4s (38 boots, full restore) vs
+        # 36.0s (75 boots, this reservation) on ResNet20/cheddar/LogN=16.
+        # More, cheaper bootstraps beat fewer, pricier ones plus wider
+        # downstream ciphertexts here.
         raw_cts = orion_params.get_boot_num_cts_levels()
         raw_stc = orion_params.get_boot_num_stc_levels()
         self._boot_enabled = raw_cts is not None and raw_stc is not None
@@ -281,8 +283,9 @@ class CheddarLibrary:
             # regular Context + BootContext roughly halves resident memory
             # -- the difference between fitting and OOMing full-slot
             # LogN=16 bootstrap on a 24GB card. Must satisfy default_enc_level
-            # == max_level - num_cts_levels - eval_mod_levels, which the
-            # chain extension above guarantees by construction.
+            # == max_level - num_cts_levels - eval_mod_levels - num_stc_levels
+            # (== BootContext's GetEndLevel()), which the chain extension
+            # above guarantees by construction.
             setup_args["BootNumCtsLevels"] = self._boot_num_cts_levels
             setup_args["BootNumStcLevels"] = self._boot_num_stc_levels
             setup_args["BootLogMessageRatio"] = self._boot_log_message_ratio
@@ -590,19 +593,42 @@ class CheddarLibrary:
                 vals = vals + [0.0] * (self._slots - len(vals))
             diags[int(idx)] = vals[:self._slots]
 
+        use_bsgs = bsgs_ratio not in ("none", None) and len(diags) > 1
+        bs = (max(1, math.ceil(math.sqrt(len(diags) * float(bsgs_ratio))))
+              if use_bsgs else None)
+
+        # Encode every diagonal's plaintext once, here at compile time,
+        # instead of on every EvaluateLinearTransform call. Diagonal values
+        # are the model's fixed trained weights -- they never depend on the
+        # input ciphertext -- so re-encoding them per-inference was pure
+        # waste. Profiled on ResNet20: ~25-29% of total runtime was spent
+        # right here (cheddar::Encoder::Encode/EncodeWorker), with the GPU
+        # sitting idle the whole time (CPU-bound encode). BSGS's giant-step
+        # roll is diagonal-index-determined too, so it's baked into the
+        # cached plaintext rather than redone per evaluate.
+        pt_ids: dict[int, int] = {}
+        if use_bsgs:
+            for k, vals in diags.items():
+                g = k // bs
+                shifted = vals if g == 0 else np.roll(vals, g * bs).tolist()
+                pt_ids[k] = self._lt_encode(shifted, level)
+        else:
+            for k, vals in diags.items():
+                pt_ids[k] = self._lt_encode(vals, level)
+
         lt_id = self._next_lt_id
         self._next_lt_id += 1
-        self._transforms[lt_id] = {"diags": diags, "bsgs_ratio": bsgs_ratio}
+        self._transforms[lt_id] = {
+            "diags": diags, "bsgs_ratio": bsgs_ratio,
+            "use_bsgs": use_bsgs, "bs": bs, "pt_ids": pt_ids,
+        }
         return lt_id
 
     def _lt_use_bsgs(self, lt_id: int) -> bool:
-        t = self._transforms[lt_id]
-        return t["bsgs_ratio"] not in ("none", None) and len(t["diags"]) > 1
+        return self._transforms[lt_id]["use_bsgs"]
 
     def _lt_bsgs_stride(self, lt_id: int) -> int:
-        t = self._transforms[lt_id]
-        return max(1, math.ceil(
-            math.sqrt(len(t["diags"]) * float(t["bsgs_ratio"]))))
+        return self._transforms[lt_id]["bs"]
 
     def GetLinearTransformRotationKeys(self, lt_id: int) -> list[int]:
         # Pow2 mode never needs per-layer exact distances -- _rotate_lt
@@ -629,35 +655,31 @@ class CheddarLibrary:
         self.AddRotationKey(int(k))
 
     def EvaluateLinearTransform(self, lt_id: int, ct_id: int) -> int:
-        diags = self._transforms[lt_id]["diags"]
-        if self._lt_use_bsgs(lt_id):
-            return self._eval_lt_bsgs(ct_id, diags, self._lt_bsgs_stride(lt_id))
-        return self._eval_lt_naive(ct_id, diags)
+        t = self._transforms[lt_id]
+        if t["use_bsgs"]:
+            return self._eval_lt_bsgs(ct_id, t["diags"], t["bs"], t["pt_ids"])
+        return self._eval_lt_naive(ct_id, t["diags"], t["pt_ids"])
 
     def _lt_encode(self, values, level: int) -> int:
         return self.Encode(values, level, self._default_scale)
 
-    def _eval_lt_naive(self, ct_id: int, diags: dict[int, list[float]]) -> int:
-        level = self.GetCiphertextLevel(ct_id)
+    def _eval_lt_naive(self, ct_id: int, diags: dict[int, list[float]],
+                       pt_ids: dict[int, int]) -> int:
         result = None
-        for k, vals in diags.items():
+        for k in diags:
             rotated = self._rotate_lt(ct_id, k)
-            pt = self._lt_encode(vals, level)
-            prod = self.MulPlaintextNew(rotated, pt)
-            self.DeletePlaintext(pt)
+            prod = self.MulPlaintextNew(rotated, pt_ids[k])
             if rotated != ct_id:
                 self.DeleteCiphertext(rotated)
             result = prod if result is None else self._lt_accumulate(result, prod)
         return result
 
     def _eval_lt_bsgs(self, ct_id: int, diags: dict[int, list[float]],
-                      bs: int) -> int:
-        level = self.GetCiphertextLevel(ct_id)
-
-        giant_groups: dict[int, list[tuple[int, list[float]]]] = {}
-        for k, vals in diags.items():
+                      bs: int, pt_ids: dict[int, int]) -> int:
+        giant_groups: dict[int, list[tuple[int, int]]] = {}
+        for k in diags:
             b, g = k % bs, k // bs
-            giant_groups.setdefault(g, []).append((b, vals))
+            giant_groups.setdefault(g, []).append((b, k))
 
         needed_babies = sorted({b for group in giant_groups.values()
                                 for b, _ in group})
@@ -666,11 +688,8 @@ class CheddarLibrary:
         result = None
         for g, group in giant_groups.items():
             inner = None
-            for b, vals in group:
-                shifted = vals if g == 0 else np.roll(vals, g * bs).tolist()
-                pt = self._lt_encode(shifted, level)
-                prod = self.MulPlaintextNew(baby_rots[b], pt)
-                self.DeletePlaintext(pt)
+            for b, k in group:
+                prod = self.MulPlaintextNew(baby_rots[b], pt_ids[k])
                 inner = prod if inner is None else self._lt_accumulate(inner, prod)
 
             partial = self._rotate_lt(inner, g * bs)
@@ -690,7 +709,10 @@ class CheddarLibrary:
         return out
 
     def DeleteLinearTransform(self, lt_id: int) -> None:
-        self._transforms.pop(lt_id, None)
+        t = self._transforms.pop(lt_id, None)
+        if t is not None:
+            for pt_id in t["pt_ids"].values():
+                self.DeletePlaintext(pt_id)
 
     def RemoveRotationKeys(self) -> None:
         """No-op. Cheddar caches rotation keys natively; no release path."""
